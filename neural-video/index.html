@@ -1,0 +1,698 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Neural Video Codec</title>
+<meta name="description" content="Overfit a tiny neural network to a video, then play the video back out of the weights.">
+<style>
+  :root {
+    --bg: #0e1013; --panel: #16191f; --line: #262b34; --ink: #e6e9ef;
+    --dim: #8b94a3; --accent: #6fd3c7; --warn: #e8b04b; --bad: #e8695b;
+    --mono: ui-monospace, SFMono-Regular, "SF Mono", Menlo, Consolas, monospace;
+  }
+  * { box-sizing: border-box; }
+  body {
+    margin: 0; background: var(--bg); color: var(--ink); font: 15px/1.6 var(--mono);
+    padding: 32px 20px 80px;
+  }
+  .wrap { max-width: 1000px; margin: 0 auto; }
+  h1 { font-size: 22px; margin: 0 0 6px; letter-spacing: -0.01em; }
+  h2 { font-size: 14px; margin: 32px 0 12px; color: var(--dim);
+       text-transform: uppercase; letter-spacing: 0.08em; font-weight: 600; }
+  .lede { color: var(--dim); margin: 0 0 28px; max-width: 68ch; }
+  a { color: var(--accent); }
+
+  .panel { background: var(--panel); border: 1px solid var(--line);
+           border-radius: 10px; padding: 18px; }
+  .row { display: flex; gap: 16px; flex-wrap: wrap; align-items: flex-end; }
+  label { display: block; font-size: 12px; color: var(--dim); margin-bottom: 4px; }
+  select, input[type=file], input[type=number] {
+    background: #0b0d10; color: var(--ink); border: 1px solid var(--line);
+    border-radius: 6px; padding: 7px 9px; font: inherit; font-size: 13px;
+  }
+  button {
+    background: var(--accent); color: #06231f; border: 0; border-radius: 6px;
+    padding: 9px 16px; font: inherit; font-weight: 700; cursor: pointer;
+  }
+  button.ghost { background: transparent; color: var(--ink); border: 1px solid var(--line); font-weight: 500; }
+  button:disabled { opacity: 0.4; cursor: not-allowed; }
+
+  .stage { display: grid; grid-template-columns: 1fr 1fr; gap: 16px; margin-top: 18px; }
+  .frame { background: #07090b; border: 1px solid var(--line); border-radius: 10px;
+           padding: 12px; text-align: center; }
+  .frame canvas { width: 100%; max-width: 320px; image-rendering: pixelated;
+                  border-radius: 6px; background: #000; display: block; margin: 0 auto; }
+  .frame .cap { font-size: 12px; color: var(--dim); margin-top: 10px; }
+  @media (max-width: 620px) { .stage { grid-template-columns: 1fr; } }
+
+  .bar { height: 4px; background: var(--line); border-radius: 2px; overflow: hidden; margin: 16px 0 10px; }
+  .bar > i { display: block; height: 100%; width: 0; background: var(--accent); transition: width .2s; }
+  #status { font-size: 13px; color: var(--dim); min-height: 22px; }
+
+  table { border-collapse: collapse; width: 100%; font-size: 13px; margin-top: 4px; }
+  td { padding: 6px 10px 6px 0; border-bottom: 1px solid var(--line); }
+  td:first-child { color: var(--dim); width: 45%; }
+  td:last-child { text-align: right; font-variant-numeric: tabular-nums; }
+  .good { color: var(--accent); } .warn { color: var(--warn); } .bad { color: var(--bad); }
+  .note { color: var(--dim); font-size: 13px; }
+  code { background: #0b0d10; padding: 1px 5px; border-radius: 4px; font-size: 0.92em; }
+</style>
+</head>
+<body>
+<div class="wrap">
+
+  <h1>Neural video codec</h1>
+  <p class="lede">
+    Pick a video. A small neural network is trained, in your browser, to memorise
+    that one clip: it maps a timestamp to a frame of pixels. Once trained, the
+    video is thrown away and playback runs entirely out of the network's weights.
+    The weights are the file. Whether that is <em>good</em> compression is what the
+    numbers at the bottom are for.
+  </p>
+
+  <div class="panel">
+    <div class="row">
+      <div>
+        <label for="file">video file</label>
+        <input type="file" id="file" accept="video/*">
+      </div>
+      <div>
+        <label for="res">resolution</label>
+        <select id="res">
+          <option value="64">64 px</option>
+          <option value="96" selected>96 px</option>
+          <option value="128">128 px</option>
+          <option value="160">160 px</option>
+        </select>
+      </div>
+      <div>
+        <label for="nframes">frames</label>
+        <select id="nframes">
+          <option value="16">16</option>
+          <option value="32" selected>32</option>
+          <option value="48">48</option>
+          <option value="64">64</option>
+        </select>
+      </div>
+      <div>
+        <label for="budget">weight budget</label>
+        <select id="budget">
+          <option value="30000">30k params (tiny)</option>
+          <option value="80000" selected>80k params</option>
+          <option value="160000">160k params</option>
+          <option value="320000">320k params (roomy)</option>
+        </select>
+      </div>
+      <div>
+        <label for="epochs">epochs</label>
+        <select id="epochs">
+          <option value="100">100 (fast)</option>
+          <option value="250" selected>250</option>
+          <option value="500">500 (better)</option>
+        </select>
+      </div>
+      <div style="margin-left:auto; display:flex; gap:8px;">
+        <button id="demo" class="ghost">use demo clip</button>
+        <button id="train" disabled>learn this video</button>
+      </div>
+    </div>
+
+    <div class="bar"><i id="prog"></i></div>
+    <div id="status">Load a video file, or click “use demo clip” to try it with a synthetic one.</div>
+
+    <div class="stage">
+      <div class="frame">
+        <canvas id="cvSrc" width="96" height="96"></canvas>
+        <div class="cap">original frames</div>
+      </div>
+      <div class="frame">
+        <canvas id="cvOut" width="96" height="96"></canvas>
+        <div class="cap" id="capOut">network output</div>
+      </div>
+    </div>
+
+    <div class="row" style="margin-top:16px">
+      <button id="play" class="ghost" disabled>play from the model</button>
+      <button id="save" class="ghost" disabled>download weights (.nvcw)</button>
+      <div>
+        <label for="loadw">play a .nvcw file</label>
+        <input type="file" id="loadw" accept=".nvcw,.bin">
+      </div>
+    </div>
+  </div>
+
+  <h2>Is it compression?</h2>
+  <div class="panel">
+    <table id="stats">
+      <tr><td>state</td><td id="s-state">nothing trained yet</td></tr>
+    </table>
+    <p class="note" id="verdict" style="margin-bottom:0"></p>
+  </div>
+
+  <h2>What is actually happening</h2>
+  <div class="panel note">
+    <p style="margin-top:0">
+      The network is <code>f(t) &rarr; frame</code>: a timestamp goes through a Fourier
+      feature embedding and a small MLP, which produces a low-resolution feature map;
+      convolution + pixel-shuffle blocks upsample that 32&times; into RGB. Training is
+      pure overfitting on a single clip — there is no dataset and no generalisation.
+      Afterwards the weights are quantised to 8 bits per value, which is what the
+      reported file size measures.
+    </p>
+    <p style="margin-bottom:0">
+      This is the NeRV family of implicit neural representations. There is a
+      command-line version with proper entropy coding and an
+      <code>x264</code> benchmark in <code>nvc.py</code> next to this page.
+    </p>
+  </div>
+
+</div>
+
+<script src="https://cdn.jsdelivr.net/npm/@tensorflow/tfjs@4.22.0/dist/tf.min.js"></script>
+<script>
+(() => {
+"use strict";
+
+const $ = id => document.getElementById(id);
+const STRIDES = [4, 4, 2];             // 32x total upsample
+const UP = STRIDES.reduce((a, b) => a * b, 1);
+const EMBED_LEVELS = 10;
+const QUANT_BITS = 8;
+
+let clip = null;        // {frames: Float32Array[], w, h, n, fps, srcBytes, name}
+let net = null;         // TinyNeRV
+let playTimer = null;
+
+// ---------------------------------------------------------------- helpers
+
+const fmtBytes = n => n < 1024 ? `${n | 0} B`
+  : n < 1024 * 1024 ? `${(n / 1024).toFixed(1)} KB`
+  : `${(n / 1048576).toFixed(2)} MB`;
+
+const snap = (v, m) => Math.max(m, Math.round(v / m) * m);
+
+function gelu(x) {
+  return tf.tidy(() => {
+    const c = tf.mul(0.7978845608, tf.add(x, tf.mul(0.044715, tf.pow(x, 3))));
+    return tf.mul(tf.mul(0.5, x), tf.add(1, tf.tanh(c)));
+  });
+}
+
+function uniformVar(shape, bound, name) {
+  return tf.variable(tf.randomUniform(shape, -bound, bound), true, name);
+}
+
+/** Pixel shuffle: [B, H, W, C*s*s] -> [B, H*s, W*s, C].
+ *  TensorFlow.js ships this op but without a registered gradient, so it cannot
+ *  appear inside a training graph. reshape and transpose both differentiate
+ *  fine, and this ordering matches the built-in op. */
+function pixelShuffle(x, s) {
+  return tf.tidy(() => {
+    const [b, h, w, ch] = x.shape;
+    const c = ch / (s * s);
+    let y = tf.reshape(x, [b, h, w, s, s, c]);
+    y = tf.transpose(y, [0, 1, 3, 2, 4, 5]);
+    return tf.reshape(y, [b, h * s, w * s, c]);
+  });
+}
+
+function status(msg) { $("status").textContent = msg; }
+function progress(p) { $("prog").style.width = `${Math.round(p * 100)}%`; }
+
+// ------------------------------------------------------------- the network
+
+class TinyNeRV {
+  constructor(h, w, channels) {
+    this.h = h; this.w = w; this.channels = channels;
+    this.bh = h / UP; this.bw = w / UP;
+    this.vars = [];
+
+    const embDim = 2 * EMBED_LEVELS;
+    this.W1 = this._lin([embDim, channels]);
+    this.b1 = this._zeros([channels]);
+    const fcOut = channels * this.bh * this.bw;
+    this.W2 = this._lin([channels, fcOut]);
+    this.b2 = this._zeros([fcOut]);
+
+    this.convs = [];
+    let c = channels;
+    for (const s of STRIDES) {
+      const cOut = Math.max(16, c >> 1);
+      this.convs.push({ W: this._conv([3, 3, c, cOut * s * s]), b: this._zeros([cOut * s * s]), s });
+      c = cOut;
+    }
+    this.headW = this._conv([3, 3, c, 3]);
+    this.headB = this._zeros([3]);
+
+    // Frequencies for the time embedding, held as a constant (not trained).
+    this.freqs = tf.keep(tf.tensor1d(
+      Array.from({ length: EMBED_LEVELS }, (_, i) => Math.pow(2, i) * Math.PI)));
+  }
+
+  _track(v) { this.vars.push(v); return v; }
+  _lin(shape) { return this._track(uniformVar(shape, Math.sqrt(6 / shape[0]))); }
+  _conv(shape) {
+    const fanIn = shape[0] * shape[1] * shape[2];
+    return this._track(uniformVar(shape, Math.sqrt(6 / fanIn)));
+  }
+  _zeros(shape) { return this._track(tf.variable(tf.zeros(shape), true)); }
+
+  paramCount() { return this.vars.reduce((a, v) => a + v.size, 0); }
+
+  // t: [B, 1] in [0,1]  ->  [B, h, w, 3] in [0,1]
+  forward(t) {
+    return tf.tidy(() => {
+      const ang = tf.mul(t, this.freqs.expandDims(0));        // [B, L]
+      const emb = tf.concat([tf.sin(ang), tf.cos(ang)], 1);   // [B, 2L]
+      let x = gelu(tf.add(tf.matMul(emb, this.W1), this.b1));
+      x = tf.add(tf.matMul(x, this.W2), this.b2);
+      x = tf.reshape(x, [-1, this.bh, this.bw, this.channels]);
+      for (const { W, b, s } of this.convs) {
+        x = tf.add(tf.conv2d(x, W, 1, "same"), b);
+        x = gelu(pixelShuffle(x, s));
+      }
+      return tf.sigmoid(tf.add(tf.conv2d(x, this.headW, 1, "same"), this.headB));
+    });
+  }
+
+  /** Quantise every weight to `bits` and write the values back in place.
+   *  Playback then reflects exactly what a decoder would see. */
+  async quantizeInPlace(bits = QUANT_BITS) {
+    const levels = (1 << bits) - 1;
+    const blobs = [];
+    for (const v of this.vars) {
+      const data = await v.data();
+      let lo = Infinity, hi = -Infinity;
+      for (const x of data) { if (x < lo) lo = x; if (x > hi) hi = x; }
+      const scale = hi > lo ? (hi - lo) / levels : 1;
+      const q = new Uint8Array(data.length);
+      const deq = new Float32Array(data.length);
+      for (let i = 0; i < data.length; i++) {
+        const qi = Math.min(levels, Math.max(0, Math.round((data[i] - lo) / scale)));
+        q[i] = qi;
+        deq[i] = qi * scale + lo;
+      }
+      v.assign(tf.tensor(deq, v.shape));
+      blobs.push({ shape: v.shape, min: lo, scale, q });
+    }
+    return blobs;
+  }
+
+  loadBlobs(blobs) {
+    this.vars.forEach((v, i) => {
+      const { min, scale, q } = blobs[i];
+      const deq = new Float32Array(q.length);
+      for (let j = 0; j < q.length; j++) deq[j] = q[j] * scale + min;
+      v.assign(tf.tensor(deq, v.shape));
+    });
+  }
+
+  dispose() { this.vars.forEach(v => v.dispose()); this.freqs.dispose(); }
+}
+
+/** Widest network that still fits the parameter budget (params grow ~ C^2). */
+function widthForBudget(h, w, budget) {
+  const count = c => {
+    const bh = h / UP, bw = w / UP;
+    let n = 2 * EMBED_LEVELS * c + c + c * (c * bh * bw) + c * bh * bw;
+    let cc = c;
+    for (const s of STRIDES) {
+      const cOut = Math.max(16, cc >> 1);
+      n += 9 * cc * cOut * s * s + cOut * s * s;
+      cc = cOut;
+    }
+    return n + 9 * cc * 3 + 3;
+  };
+  let lo = 8, hi = 512, best = 8;
+  while (lo <= hi) {
+    const mid = (lo + hi) >> 1;
+    if (count(mid) <= budget) { best = mid; lo = mid + 1; } else { hi = mid - 1; }
+  }
+  return best;
+}
+
+// ------------------------------------------------------------- frame input
+
+function drawFrame(canvas, pixels, w, h) {
+  canvas.width = w; canvas.height = h;
+  const img = new ImageData(w, h);
+  for (let i = 0, p = 0; i < w * h; i++) {
+    img.data[i * 4] = Math.round(pixels[p++] * 255);
+    img.data[i * 4 + 1] = Math.round(pixels[p++] * 255);
+    img.data[i * 4 + 2] = Math.round(pixels[p++] * 255);
+    img.data[i * 4 + 3] = 255;
+  }
+  canvas.getContext("2d").putImageData(img, 0, 0);
+}
+
+function makeDemoClip(n, size) {
+  const w = size, h = size, frames = [];
+  for (let i = 0; i < n; i++) {
+    const t = i / Math.max(n - 1, 1);
+    const f = new Float32Array(w * h * 3);
+    const cx = 0.5 + 0.32 * Math.cos(2 * Math.PI * t);
+    const cy = 0.5 + 0.32 * Math.sin(2 * Math.PI * t);
+    for (let y = 0; y < h; y++) {
+      for (let x = 0; x < w; x++) {
+        const u = x / w, v = y / h, k = (y * w + x) * 3;
+        let r = 0.5 + 0.5 * Math.sin(2 * Math.PI * (u * 2 + t));
+        let g = 0.15;
+        let b = 0.5 + 0.5 * Math.cos(2 * Math.PI * (v * 2 - t));
+        if ((u - cx) ** 2 + (v - cy) ** 2 < 0.02) { r = 1; g = 0.95; b = 0.2; }
+        if (Math.abs(v - (0.2 + 0.6 * t)) < 0.03) { r = 0.05; g = 0.05; b = 0.08; }
+        f[k] = r; f[k + 1] = g; f[k + 2] = b;
+      }
+    }
+    frames.push(f);
+  }
+  return { frames, w, h, n, fps: 12, srcBytes: 0, name: "demo clip" };
+}
+
+async function extractFrames(file, longSide, count) {
+  const url = URL.createObjectURL(file);
+  const video = document.createElement("video");
+  video.src = url; video.muted = true; video.playsInline = true;
+  video.preload = "auto";
+  await new Promise((res, rej) => {
+    video.onloadedmetadata = res;
+    video.onerror = () => rej(new Error("could not decode that video"));
+  });
+
+  const scale = longSide / Math.max(video.videoWidth, video.videoHeight);
+  const w = snap(video.videoWidth * scale, UP);
+  const h = snap(video.videoHeight * scale, UP);
+  const cv = document.createElement("canvas");
+  cv.width = w; cv.height = h;
+  const ctx = cv.getContext("2d", { willReadFrequently: true });
+
+  const duration = isFinite(video.duration) && video.duration > 0 ? video.duration : 1;
+  const span = Math.min(duration, 10);       // keep it a short clip
+  const frames = [];
+  for (let i = 0; i < count; i++) {
+    const t = (i / Math.max(count - 1, 1)) * span * 0.98;
+    await new Promise(res => {
+      const done = () => { video.removeEventListener("seeked", done); res(); };
+      video.addEventListener("seeked", done);
+      video.currentTime = t;
+      setTimeout(done, 2000);               // guard against browsers that stall
+    });
+    ctx.drawImage(video, 0, 0, w, h);
+    const d = ctx.getImageData(0, 0, w, h).data;
+    const f = new Float32Array(w * h * 3);
+    for (let p = 0, q = 0; p < w * h; p++) {
+      f[q++] = d[p * 4] / 255; f[q++] = d[p * 4 + 1] / 255; f[q++] = d[p * 4 + 2] / 255;
+    }
+    frames.push(f);
+    progress((i + 1) / count * 0.15);
+    status(`extracting frames ${i + 1}/${count} at ${w}x${h}...`);
+  }
+  URL.revokeObjectURL(url);
+  const fps = count / span;
+  return { frames, w, h, n: count, fps, srcBytes: file.size, name: file.name };
+}
+
+// ---------------------------------------------------------------- training
+
+function targetTensor(c) {
+  const flat = new Float32Array(c.n * c.h * c.w * 3);
+  c.frames.forEach((f, i) => flat.set(f, i * f.length));
+  return tf.tensor4d(flat, [c.n, c.h, c.w, 3]);
+}
+
+function psnrFromMse(mse) { return 10 * Math.log10(1 / Math.max(mse, 1e-9)); }
+
+async function train() {
+  const epochs = +$("epochs").value;
+  const budget = +$("budget").value;
+
+  if (net) net.dispose();
+  const channels = widthForBudget(clip.h, clip.w, budget);
+  net = new TinyNeRV(clip.h, clip.w, channels);
+  const nParams = net.paramCount();
+
+  const target = targetTensor(clip);
+  const times = tf.tensor2d(
+    Array.from({ length: clip.n }, (_, i) => [i / Math.max(clip.n - 1, 1)]),
+    [clip.n, 1]);
+  const baseLr = 2e-3;
+  const opt = tf.train.adam(baseLr);
+  const batch = Math.min(4, clip.n);
+  const stepsPerEpoch = Math.ceil(clip.n / batch);
+
+  status(`training: ${nParams.toLocaleString()} parameters (width ${channels})`);
+  let lastMse = 1, t0 = performance.now();
+
+  for (let epoch = 0; epoch < epochs; epoch++) {
+    // Cosine decay. Overfitting a single clip benefits a lot from annealing
+    // the step size to nearly zero at the end.
+    opt.learningRate = baseLr * (0.5 * (1 + Math.cos(Math.PI * epoch / epochs)));
+    const order = tf.util.createShuffledIndices(clip.n);
+    let sum = 0;
+    for (let s = 0; s < stepsPerEpoch; s++) {
+      const idxArr = Array.from(order.slice(s * batch, s * batch + batch));
+      if (!idxArr.length) continue;
+      const idx = tf.tensor1d(idxArr, "int32");
+      const cost = opt.minimize(() => tf.tidy(() => {
+        const pred = net.forward(times.gather(idx));
+        return tf.losses.meanSquaredError(target.gather(idx), pred);
+      }), true);
+      sum += (await cost.data())[0];
+      cost.dispose();
+      idx.dispose();
+    }
+    lastMse = sum / stepsPerEpoch;
+
+    if (epoch % 5 === 0 || epoch === epochs - 1) {
+      const secs = (performance.now() - t0) / 1000;
+      const eta = secs / (epoch + 1) * (epochs - epoch - 1);
+      status(`epoch ${epoch + 1}/${epochs} — ${psnrFromMse(lastMse).toFixed(2)} dB — ` +
+             `${secs.toFixed(0)}s elapsed, ~${eta.toFixed(0)}s left`);
+      progress(0.15 + 0.8 * (epoch + 1) / epochs);
+      await previewFrame(Math.floor(clip.n / 2));
+      await tf.nextFrame();
+    }
+  }
+
+  status("quantising weights to 8 bits...");
+  await tf.nextFrame();
+  const blobs = await net.quantizeInPlace(QUANT_BITS);
+  // Pack immediately so the size we report is the size of the file you can
+  // actually download, header and all - not an estimate of it.
+  window.__nvcw = packWeights(blobs);
+
+  const mse = await measureMse(target);
+  report(nParams, channels, mse, window.__nvcw.length);
+
+  target.dispose(); times.dispose(); opt.dispose();
+  progress(1);
+  status(`done — ${psnrFromMse(mse).toFixed(2)} dB from ` +
+         `${fmtBytes(window.__nvcw.length)} of weights`);
+  $("play").disabled = false; $("save").disabled = false;
+  startPlayback();
+}
+
+async function measureMse(target) {
+  const times = tf.tensor2d(
+    Array.from({ length: clip.n }, (_, i) => [i / Math.max(clip.n - 1, 1)]), [clip.n, 1]);
+  let total = 0;
+  for (let i = 0; i < clip.n; i += 4) {
+    const t = times.slice([i, 0], [Math.min(4, clip.n - i), 1]);
+    const [mse, count] = tf.tidy(() => {
+      const pred = net.forward(t);
+      const ref = target.slice([i, 0, 0, 0], [pred.shape[0], -1, -1, -1]);
+      // Round-trip through 8-bit pixels so this matches what you actually see.
+      const q = tf.div(tf.round(tf.mul(pred, 255)), 255);
+      return [tf.mean(tf.square(tf.sub(q, ref))), pred.shape[0]];
+    });
+    total += (await mse.data())[0] * count;
+    mse.dispose(); t.dispose();
+  }
+  times.dispose();
+  return total / clip.n;
+}
+
+async function previewFrame(i) {
+  const t = tf.tensor2d([[i / Math.max(clip.n - 1, 1)]], [1, 1]);
+  const out = net.forward(t);
+  const data = await out.data();
+  drawFrame($("cvOut"), data, clip.w, clip.h);
+  drawFrame($("cvSrc"), clip.frames[i], clip.w, clip.h);
+  out.dispose(); t.dispose();
+}
+
+// ----------------------------------------------------------------- results
+
+function report(nParams, channels, mse, bytes) {
+  const px = clip.n * clip.w * clip.h;
+  const raw = px * 3;
+  const bpp = bytes * 8 / px;
+  const psnr = psnrFromMse(mse);
+  const cls = psnr > 34 ? "good" : psnr > 27 ? "warn" : "bad";
+
+  const rows = [
+    ["clip", `${clip.n} frames · ${clip.w}×${clip.h}`],
+    ["network", `${nParams.toLocaleString()} params · width ${channels}`],
+    ["weights at 8 bits", `<b>${fmtBytes(bytes)}</b>`],
+    ["bits per pixel", bpp.toFixed(3)],
+    ["quality", `<span class="${cls}">${psnr.toFixed(2)} dB PSNR</span>`],
+    ["vs raw RGB", `${(raw / bytes).toFixed(1)}× smaller (${fmtBytes(raw)} → ${fmtBytes(bytes)})`],
+  ];
+  if (clip.srcBytes) {
+    rows.push(["original file", `${fmtBytes(clip.srcBytes)} (full length &amp; resolution — not comparable)`]);
+  }
+  $("stats").innerHTML = rows
+    .map(([k, v]) => `<tr><td>${k}</td><td>${v}</td></tr>`).join("");
+
+  $("verdict").innerHTML = psnr >= 32
+    ? `Recognisable reconstruction at ${bpp.toFixed(2)} bpp. For reference, ` +
+      `H.264 typically holds this kind of clip at similar quality for well under ` +
+      `0.1 bpp — so this is real compression, just not competitive compression. ` +
+      `Run <code>nvc.py encode --compare</code> for a like-for-like x264 benchmark.`
+    : `Only ${psnr.toFixed(1)} dB — the network is too small, or undertrained, for ` +
+      `this clip. Raise the weight budget or the epoch count and try again.`;
+}
+
+// ---------------------------------------------------------------- playback
+
+function stopPlayback() { if (playTimer) { clearInterval(playTimer); playTimer = null; } }
+
+function startPlayback() {
+  stopPlayback();
+  let i = 0;
+  const fps = Math.min(30, Math.max(4, clip.fps));
+  $("capOut").textContent = "playing from the weights only";
+  playTimer = setInterval(async () => {
+    if (!net) return stopPlayback();
+    await previewFrame(i % clip.n);
+    i++;
+  }, 1000 / fps);
+}
+
+// -------------------------------------------------------- weight file i/o
+
+function packWeights(blobs) {
+  const meta = blobs.map(b => ({ shape: b.shape, min: b.min, scale: b.scale, n: b.q.length }));
+  const header = JSON.stringify({
+    magic: "NVCW1", w: clip.w, h: clip.h, n: clip.n, fps: clip.fps,
+    channels: net.channels, bits: QUANT_BITS, tensors: meta,
+  });
+  const hb = new TextEncoder().encode(header);
+  const total = 4 + hb.length + blobs.reduce((a, b) => a + b.q.length, 0);
+  const buf = new Uint8Array(total);
+  new DataView(buf.buffer).setUint32(0, hb.length, true);
+  buf.set(hb, 4);
+  let off = 4 + hb.length;
+  for (const b of blobs) { buf.set(b.q, off); off += b.q.length; }
+  return buf;
+}
+
+function unpackWeights(buf) {
+  const view = new DataView(buf.buffer, buf.byteOffset);
+  const hlen = view.getUint32(0, true);
+  const header = JSON.parse(new TextDecoder().decode(buf.subarray(4, 4 + hlen)));
+  if (header.magic !== "NVCW1") throw new Error("not an .nvcw file");
+  let off = 4 + hlen;
+  const blobs = header.tensors.map(t => {
+    const q = buf.subarray(off, off + t.n); off += t.n;
+    return { shape: t.shape, min: t.min, scale: t.scale, q };
+  });
+  return { header, blobs };
+}
+
+// -------------------------------------------------------------------- wire
+
+$("file").addEventListener("change", async e => {
+  const f = e.target.files[0];
+  if (!f) return;
+  $("train").disabled = true;
+  stopPlayback();
+  try {
+    status("decoding video...");
+    clip = await extractFrames(f, +$("res").value, +$("nframes").value);
+    drawFrame($("cvSrc"), clip.frames[0], clip.w, clip.h);
+    $("capOut").textContent = "network output";
+    status(`ready: ${clip.n} frames at ${clip.w}×${clip.h}. Click “learn this video”.`);
+    progress(0.15);
+    $("train").disabled = false;
+  } catch (err) {
+    status(`error: ${err.message}`);
+  }
+});
+
+$("demo").addEventListener("click", () => {
+  stopPlayback();
+  const size = snap(+$("res").value, UP);
+  clip = makeDemoClip(+$("nframes").value, size);
+  drawFrame($("cvSrc"), clip.frames[0], clip.w, clip.h);
+  $("capOut").textContent = "network output";
+  status(`demo clip ready: ${clip.n} frames at ${size}×${size}. Click “learn this video”.`);
+  progress(0.15);
+  $("train").disabled = false;
+});
+
+$("train").addEventListener("click", async () => {
+  if (!clip) return;
+  stopPlayback();
+  $("train").disabled = true; $("play").disabled = true; $("save").disabled = true;
+  try {
+    await train();
+  } catch (err) {
+    console.error(err);
+    status(`training failed: ${err.message}`);
+  }
+  $("train").disabled = false;
+});
+
+$("play").addEventListener("click", startPlayback);
+
+$("save").addEventListener("click", () => {
+  if (!window.__nvcw) return;
+  const url = URL.createObjectURL(
+    new Blob([window.__nvcw], { type: "application/octet-stream" }));
+  const a = document.createElement("a");
+  a.href = url; a.download = "video.nvcw"; a.click();
+  setTimeout(() => URL.revokeObjectURL(url), 1000);
+});
+
+$("loadw").addEventListener("change", async e => {
+  const f = e.target.files[0];
+  if (!f) return;
+  try {
+    stopPlayback();
+    const { header, blobs } = unpackWeights(new Uint8Array(await f.arrayBuffer()));
+    if (net) net.dispose();
+    net = new TinyNeRV(header.h, header.w, header.channels);
+    net.loadBlobs(blobs);
+    clip = {
+      frames: Array.from({ length: header.n }, () => new Float32Array(header.w * header.h * 3)),
+      w: header.w, h: header.h, n: header.n, fps: header.fps, srcBytes: 0, name: f.name,
+    };
+    $("play").disabled = false;
+    status(`loaded ${fmtBytes(f.size)} of weights — playing a video that exists only as numbers`);
+    startPlayback();
+  } catch (err) {
+    status(`error: ${err.message}`);
+  }
+});
+
+if (typeof tf === "undefined") {
+  status("TensorFlow.js failed to load — check your network connection.");
+} else {
+  // setBackend resolves to false when a backend is unavailable rather than
+  // rejecting, so check the result instead of relying on catch().
+  (async () => {
+    let ok = false;
+    try { ok = await tf.setBackend("webgl"); } catch (e) { ok = false; }
+    if (!ok) await tf.setBackend("cpu");
+    window.__nvcReady = tf.getBackend();
+    if (tf.getBackend() !== "webgl") {
+      status("No WebGL here — running on the CPU backend, which is much slower. " +
+             "Try a small resolution and frame count.");
+    }
+  })();
+}
+})();
+</script>
+</body>
+</html>
