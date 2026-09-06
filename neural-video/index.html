@@ -123,6 +123,7 @@
       <div style="margin-left:auto; display:flex; gap:8px;">
         <button id="demo" class="ghost">use demo clip</button>
         <button id="train" disabled>learn this video</button>
+        <button id="stop" class="ghost" disabled>stop</button>
       </div>
     </div>
 
@@ -200,8 +201,13 @@ const CHANNEL_FLOORS = [16, 12, 8, 4];  // block-width floors, best first
 let clip = null;        // {frames: Float32Array[], w, h, n, fps, srcBytes, name}
 let net = null;         // TinyNeRV
 let playTimer = null;
+let stopRequested = false;
 
 // ---------------------------------------------------------------- helpers
+
+const fmtTime = s => s < 90 ? `${s.toFixed(0)}s`
+  : s < 3600 ? `${Math.floor(s / 60)}m ${(s % 60).toFixed(0)}s`
+  : `${(s / 3600).toFixed(1)}h`;
 
 const fmtBytes = n => n < 1024 ? `${n | 0} B`
   : n < 1024 * 1024 ? `${(n / 1024).toFixed(1)} KB`
@@ -530,14 +536,17 @@ async function train() {
   const stepsPerEpoch = Math.ceil(clip.n / batch);
 
   status(`training: ${nParams.toLocaleString()} parameters (width ${channels})`);
-  let lastMse = 1, t0 = performance.now();
+  await tf.nextFrame();
+  let lastMse = 1, t0 = performance.now(), lastYield = t0;
+  const totalSteps = epochs * stepsPerEpoch;
+  let stepsDone = 0;
 
-  for (let epoch = 0; epoch < epochs; epoch++) {
+  for (let epoch = 0; epoch < epochs && !stopRequested; epoch++) {
     // Cosine decay. Overfitting a single clip benefits a lot from annealing
     // the step size to nearly zero at the end.
     opt.learningRate = baseLr * (0.5 * (1 + Math.cos(Math.PI * epoch / epochs)));
     const order = tf.util.createShuffledIndices(clip.n);
-    let sum = 0;
+    let sum = 0, ran = 0;
     for (let s = 0; s < stepsPerEpoch; s++) {
       const idxArr = Array.from(order.slice(s * batch, s * batch + batch));
       if (!idxArr.length) continue;
@@ -546,24 +555,39 @@ async function train() {
         const pred = net.forward(times.gather(idx));
         return tf.losses.meanSquaredError(target.gather(idx), pred);
       }), true);
-      sum += (await cost.data())[0];
+      const loss = (await cost.data())[0];
       cost.dispose();
       idx.dispose();
-    }
-    lastMse = sum / stepsPerEpoch;
+      sum += loss; ran++; stepsDone++; lastMse = loss;
 
-    if (epoch % 5 === 0 || epoch === epochs - 1) {
-      const secs = (performance.now() - t0) / 1000;
-      const eta = secs / (epoch + 1) * (epochs - epoch - 1);
-      status(`epoch ${epoch + 1}/${epochs} — ${psnrFromMse(lastMse).toFixed(2)} dB — ` +
-             `${secs.toFixed(0)}s elapsed, ~${eta.toFixed(0)}s left`);
-      progress(0.15 + 0.8 * (epoch + 1) / epochs);
+      // Awaiting a GPU readback resolves in a microtask, and microtasks never
+      // let the browser paint. Without an explicit animation frame the page is
+      // frozen for the whole run and looks hung. Yield on a time budget rather
+      // than every step, so the rAF cadence does not throttle training.
+      const now = performance.now();
+      if (now - lastYield > 80) {
+        lastYield = now;
+        const secs = (now - t0) / 1000;
+        const eta = secs / stepsDone * (totalSteps - stepsDone);
+        status(`epoch ${epoch + 1}/${epochs} · step ${stepsDone}/${totalSteps} — ` +
+               `${psnrFromMse(lastMse).toFixed(2)} dB — ${fmtTime(secs)} in, ` +
+               `~${fmtTime(eta)} left`);
+        progress(0.15 + 0.8 * stepsDone / totalSteps);
+        await tf.nextFrame();
+      }
+      if (stopRequested) break;
+    }
+    if (ran) lastMse = sum / ran;
+
+    if (epoch % 5 === 0 || epoch === epochs - 1 || stopRequested) {
       await previewFrame(Math.floor(clip.n / 2));
       await tf.nextFrame();
+      lastYield = performance.now();
     }
   }
 
-  status("quantising weights to 8 bits...");
+  status(stopRequested ? "stopped — quantising what we have..."
+                       : "quantising weights to 8 bits...");
   await tf.nextFrame();
   const blobs = await net.quantizeInPlace(QUANT_BITS);
   // Pack immediately so the size we report is the size of the file you can
@@ -575,7 +599,8 @@ async function train() {
 
   target.dispose(); times.dispose(); opt.dispose();
   progress(1);
-  status(`done — ${psnrFromMse(mse).toFixed(2)} dB from ` +
+  status(`${stopRequested ? "stopped early" : "done"} — ` +
+         `${psnrFromMse(mse).toFixed(2)} dB from ` +
          `${fmtBytes(window.__nvcw.length)} of weights`);
   $("play").disabled = false; $("save").disabled = false;
   startPlayback();
@@ -730,14 +755,22 @@ $("demo").addEventListener("click", () => {
 $("train").addEventListener("click", async () => {
   if (!clip) return;
   stopPlayback();
-  $("train").disabled = true; $("play").disabled = true; $("save").disabled = true;
+  stopRequested = false;
+  $("train").disabled = true; $("play").disabled = true;
+  $("save").disabled = true; $("stop").disabled = false;
   try {
     await train();
   } catch (err) {
     console.error(err);
     status(`training failed: ${err.message}`);
   }
-  $("train").disabled = false;
+  $("train").disabled = false; $("stop").disabled = true;
+});
+
+$("stop").addEventListener("click", () => {
+  stopRequested = true;
+  $("stop").disabled = true;
+  status("stopping after this step...");
 });
 
 $("play").addEventListener("click", startPlayback);
