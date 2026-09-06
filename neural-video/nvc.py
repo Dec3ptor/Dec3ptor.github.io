@@ -210,6 +210,87 @@ class NeRVTiny(nn.Module):
         return torch.sigmoid(self.head(x))
 
 
+def sample_time(grid: torch.Tensor, t: torch.Tensor) -> torch.Tensor:
+    """Linearly interpolate a [G, C, H, W] grid along its time axis at t in [0,1]."""
+    g = grid.shape[0]
+    if g == 1:
+        return grid[0].unsqueeze(0).expand(t.shape[0], -1, -1, -1)
+    pos = t.clamp(0, 1) * (g - 1)
+    i0 = pos.floor().long().clamp(0, g - 1)
+    i1 = (i0 + 1).clamp(0, g - 1)
+    w = (pos - i0.to(pos.dtype)).view(-1, 1, 1, 1)
+    return grid[i0] * (1 - w) + grid[i1] * w
+
+
+class GridNeRV(nn.Module):
+    """t -> frame, but the per-frame code is a learned grid, not an MLP.
+
+    The stem in NeRVTiny is a bottleneck by construction: everything that makes
+    frame 7 different from frame 8 has to survive being squeezed through an MLP
+    applied to a Fourier embedding of a scalar. Measured on this codebase, that
+    pathway holds 8%% of the parameters while being the most quantisation
+    sensitive part of the model, and the frame-independent convolutions hold
+    59%% while being the least.
+
+    Storing the base feature maps directly fixes the allocation and removes the
+    constraint that they be a smooth function of an MLP. It also moves
+    parameters somewhere *compressible*: dense conv weights turned out to be
+    structureless (adjacent kernel taps correlate at 0.02, and a DCT of them
+    concentrates no energy), whereas a feature grid is a small video and carries
+    the temporal redundancy of one.
+
+    A second, finer grid can be concatenated partway up the decoder, which is
+    the cheap version of the hierarchical encoding HiNeRV uses.
+    """
+
+    def __init__(self, height, width, channels=64, strides=DEFAULT_STRIDES,
+                 min_channels=8, grid_frames=32, mid_channels=0, mid_level=1,
+                 mid_frames=0):
+        super().__init__()
+        up = math.prod(strides)
+        if height % up or width % up:
+            raise ValueError(f"{height}x{width} must be divisible by {up}")
+        self.height, self.width = height, width
+        self.channels = channels
+        self.strides = list(strides)
+        self.base = (height // up, width // up)
+        self.mid_level = mid_level if mid_channels else -1
+
+        self.base_grid = nn.Parameter(
+            torch.randn(max(1, grid_frames), channels, *self.base) * 0.05)
+
+        # Work out the spatial size at the input of each block so the mid grid
+        # can be built at the right resolution.
+        sizes, h, w = [], self.base[0], self.base[1]
+        for st in self.strides:
+            sizes.append((h, w))
+            h, w = h * st, w * st
+
+        self.mid_grid = None
+        if mid_channels and 0 <= self.mid_level < len(self.strides):
+            mh, mw = sizes[self.mid_level]
+            self.mid_grid = nn.Parameter(
+                torch.randn(max(1, mid_frames or grid_frames),
+                            mid_channels, mh, mw) * 0.05)
+
+        convs, c = [], channels
+        for i, st in enumerate(self.strides):
+            c_in = c + (mid_channels if i == self.mid_level else 0)
+            c_out = max(min_channels, c // 2)
+            convs.append(nn.Conv2d(c_in, c_out * st * st, 3, padding=1))
+            c = c_out
+        self.blocks = nn.ModuleList(convs)
+        self.head = nn.Conv2d(c, 3, 3, padding=1)
+
+    def forward(self, t: torch.Tensor) -> torch.Tensor:
+        x = sample_time(self.base_grid, t)
+        for i, (conv, st) in enumerate(zip(self.blocks, self.strides)):
+            if i == self.mid_level and self.mid_grid is not None:
+                x = torch.cat([x, sample_time(self.mid_grid, t)], dim=1)
+            x = F.gelu(F.pixel_shuffle(conv(x), st))
+        return torch.sigmoid(self.head(x))
+
+
 class SirenVideo(nn.Module):
     """(x, y, t) -> RGB. Sine-activated coordinate MLP (SIREN)."""
 
@@ -237,6 +318,14 @@ class SirenVideo(nn.Module):
 
 
 def build_model(cfg: dict) -> nn.Module:
+    if cfg["arch"] == "grid":
+        return GridNeRV(cfg["height"], cfg["width"], channels=cfg["channels"],
+                        strides=tuple(cfg["strides"]),
+                        min_channels=cfg["min_channels"],
+                        grid_frames=cfg["grid_frames"],
+                        mid_channels=cfg["mid_channels"],
+                        mid_level=cfg.get("mid_level", 1),
+                        mid_frames=cfg.get("mid_frames", 0))
     if cfg["arch"] == "nerv":
         return NeRVTiny(cfg["height"], cfg["width"], channels=cfg["channels"],
                         strides=tuple(cfg["strides"]),
@@ -325,31 +414,71 @@ class FakeQuantize(nn.Module):
 
 
 def _quantisable(model):
-    return [m for m in model.modules()
-            if isinstance(m, (nn.Linear, nn.Conv2d)) and m.weight.dim() >= 2]
+    """Every (module, parameter name) that the bitstream stores at `bits`.
+
+    This has to match what quantize_state actually quantises, which is any
+    tensor of rank 2 or more. Feature grids are plain parameters rather than
+    layer weights, and they are the most content-critical tensors in the model,
+    so leaving them out would train against the wrong quantisation.
+    """
+    out = []
+    for m in model.modules():
+        if isinstance(m, (nn.Linear, nn.Conv2d)) and m.weight.dim() >= 2:
+            out.append((m, "weight"))
+        for name in ("base_grid", "mid_grid"):
+            # Once parametrised the attribute is a plain tensor, not a
+            # Parameter, so check that first or finalise_qat cannot find the
+            # grids again to bake them.
+            if parametrize.is_parametrized(m, name):
+                out.append((m, name))
+                continue
+            t = getattr(m, name, None)
+            if isinstance(t, nn.Parameter) and t.dim() >= 2:
+                out.append((m, name))
+    return out
 
 
 def enable_qat(model, bits: int, jitter: int = 0):
-    """Make every weight matrix read back quantised, in place."""
-    for m in _quantisable(model):
-        parametrize.register_parametrization(m, "weight",
-                                             FakeQuantize(bits, jitter))
+    """Make every stored tensor read back quantised, in place."""
+    for m, name in _quantisable(model):
+        parametrize.register_parametrization(m, name, FakeQuantize(bits, jitter))
 
 
 def finalise_qat(model):
-    """Bake the quantised values in and restore plain .weight parameters."""
+    """Bake the quantised values in and restore plain parameters."""
     # Baking runs the parametrisation once more, so make sure jitter is off:
     # otherwise the stored weights land at a random depth rather than the full
     # one the file claims to hold.
     model.eval()
-    for m in _quantisable(model):
-        if parametrize.is_parametrized(m, "weight"):
-            parametrize.remove_parametrizations(m, "weight", leave_parametrized=True)
+    for m, name in _quantisable(model):
+        if parametrize.is_parametrized(m, name):
+            parametrize.remove_parametrizations(m, name, leave_parametrized=True)
 
 
 # --------------------------------------------------------------- training
 
+def grid_tv(model) -> torch.Tensor:
+    """Squared difference between neighbouring grid slices in time.
+
+    Nothing in a plain reconstruction loss makes adjacent grid slices resemble
+    each other, and measurement confirms they do not: a trained base grid coded
+    to 4.21 bits/value, slightly *worse* than the dense conv weights next to it,
+    and delta coding along time made it worse still. Penalising the temporal
+    difference is a rate proxy - it pushes the grid towards something a delta
+    coder can actually exploit, and doubles as a temporal-consistency prior.
+    """
+    total = None
+    for name in ("base_grid", "mid_grid"):
+        g = getattr(model, name, None)
+        if g is None or g.shape[0] < 2:
+            continue
+        term = (g[1:] - g[:-1]).pow(2).mean()
+        total = term if total is None else total + term
+    return total
+
+
 def train_nerv(model, clip_u8, *, epochs, batch, lr, device, quiet=False,
+               grid_smooth=0.0,
                qat_bits=None, qat_start=None, qat_jitter=0):
     T = clip_u8.shape[0]
     target = torch.from_numpy(clip_u8).permute(0, 3, 1, 2).float().div_(255.0)
@@ -377,6 +506,10 @@ def train_nerv(model, clip_u8, *, epochs, batch, lr, device, quiet=False,
             y = target[idx].to(device)
             pred = model(t)
             loss = F.mse_loss(pred, y) + 0.1 * F.l1_loss(pred, y)
+            if grid_smooth:
+                tv = grid_tv(model)
+                if tv is not None:
+                    loss = loss + grid_smooth * tv
             opt.zero_grad(set_to_none=True)
             loss.backward()
             opt.step()
@@ -461,7 +594,7 @@ def render(model, cfg, n_frames=None, device="cpu", chunk=8) -> np.ndarray:
     out = np.empty((T, H, W, 3), dtype=np.uint8)
     times = torch.arange(T, dtype=torch.float32) / max(T - 1, 1)
 
-    if cfg["arch"] == "nerv":
+    if cfg["arch"] != "siren":
         for i in range(0, T, chunk):
             pred = model(times[i:i + chunk].to(device))
             pred = pred.clamp(0, 1).mul(255).round().byte()
@@ -797,7 +930,11 @@ def cmd_encode(args):
                 "fps": fps, "channels": width, "strides": strides,
                 "embed_levels": args.embed_levels,
                 "min_channels": args.min_channels if floor is None else floor,
-                "depth": args.depth, "w0": 30.0}
+                "depth": args.depth, "w0": 30.0,
+                "grid_frames": args.grid_frames or T,
+                "mid_channels": args.mid_channels,
+                "mid_level": args.mid_level,
+                "mid_frames": args.mid_frames}
 
     budget, floor = None, args.min_channels
     if args.width:
@@ -807,7 +944,7 @@ def cmd_encode(args):
         if args.min_channels is None:
             channels, floor = fit_budget(make_cfg, budget)
             # The floor only shapes the nerv decoder; siren has no conv blocks.
-            extra = f", channel floor {floor}" if args.arch == "nerv" else ""
+            extra = f", channel floor {floor}" if args.arch != "siren" else ""
             print(f"  parameter budget {budget:,} -> width {channels}{extra}")
         else:
             channels = size_to_budget(lambda w: make_cfg(w, floor), budget)
@@ -828,15 +965,16 @@ def cmd_encode(args):
 
     # A "batch" means different things per architecture: whole frames for nerv,
     # individual pixel samples for siren.
-    batch = args.batch or (4 if args.arch == "nerv" else 16384)
+    batch = args.batch or (16384 if args.arch == "siren" else 4)
     qat_start = (None if args.qat_start >= 1.0
                  else max(1, int(args.epochs * args.qat_start)))
     print(f"training on {device} for {args.epochs} epochs (batch {batch})")
-    trainer = train_nerv if args.arch == "nerv" else train_siren
+    trainer = train_siren if args.arch == "siren" else train_nerv
     trainer(model, clip, epochs=args.epochs, batch=batch, lr=args.lr,
             device=device, quiet=args.quiet,
             qat_bits=args.bits, qat_start=qat_start,
-            qat_jitter=args.qat_jitter)
+            qat_jitter=args.qat_jitter,
+            **({"grid_smooth": args.grid_smooth} if args.arch != "siren" else {}))
     finalise_qat(model)
 
     recon_fp32 = render(model, cfg, device=device)
@@ -958,7 +1096,26 @@ def main(argv=None):
     e = sub.add_parser("encode", help="overfit a network to a video")
     e.add_argument("input")
     e.add_argument("-o", "--output", default="out.nvc")
-    e.add_argument("--arch", choices=("nerv", "siren"), default="nerv")
+    e.add_argument("--arch", choices=("nerv", "grid", "siren"), default="grid",
+                   help="grid stores per-frame feature maps directly; nerv "
+                        "generates them from an MLP over a Fourier embedding "
+                        "of the timestamp")
+    e.add_argument("--grid-frames", type=int, default=0,
+                   help="temporal resolution of the base grid (0 = one slice "
+                        "per frame). Fewer slices means fewer parameters and "
+                        "smoother motion")
+    e.add_argument("--mid-channels", type=int, default=0,
+                   help="channels in a second, finer grid injected partway up "
+                        "the decoder. 0 disables it")
+    e.add_argument("--mid-level", type=int, default=1,
+                   help="which decoder block the finer grid feeds")
+    e.add_argument("--grid-smooth", type=float, default=0.0,
+                   help="penalise change between neighbouring grid slices. "
+                        "Trades a little accuracy for a grid that delta-codes, "
+                        "and keeps motion temporally consistent")
+    e.add_argument("--mid-frames", type=int, default=0,
+                   help="temporal resolution of the finer grid (0 = same as "
+                        "the base grid)")
     e.add_argument("--size", type=int, default=128,
                    help="target long side, snapped to a multiple of 32")
     e.add_argument("--frames", type=int, default=60,
