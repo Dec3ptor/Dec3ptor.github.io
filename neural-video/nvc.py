@@ -243,6 +243,22 @@ def build_model(cfg: dict) -> nn.Module:
     return SirenVideo(hidden=cfg["channels"], depth=cfg["depth"], w0=cfg["w0"])
 
 
+def fit_budget(make_cfg, budget: int, floors=(16, 12, 8, 4)):
+    """Choose a channel floor and a layer width for a parameter budget.
+
+    The floor sets the smallest model the architecture can express, so a high
+    floor makes small budgets unreachable. It also buys quality: at a 150k
+    budget a floor of 16 measured ~0.45 dB better than 8. So take the largest
+    floor whose smallest model still fits, and widen from there.
+    """
+    for floor in floors:
+        width = size_to_budget(lambda w: make_cfg(w, floor), budget)
+        if count_params(build_model(make_cfg(width, floor))) <= budget:
+            return width, floor
+    floor = floors[-1]
+    return size_to_budget(lambda w: make_cfg(w, floor), budget), floor
+
+
 def size_to_budget(make_cfg, target_params: int, lo=8, hi=1024) -> int:
     """Binary search the widest model whose parameter count fits the budget."""
     best = lo
@@ -567,22 +583,37 @@ def cmd_encode(args):
 
     strides = [int(x) for x in str(args.strides).split(",") if x.strip()]
 
-    def make_cfg(width):
+    def make_cfg(width, floor=None):
         return {"arch": args.arch, "height": H, "width": W, "frames": T,
                 "fps": fps, "channels": width, "strides": strides,
-                "embed_levels": args.embed_levels, "min_channels": 16,
+                "embed_levels": args.embed_levels,
+                "min_channels": args.min_channels if floor is None else floor,
                 "depth": args.depth, "w0": 30.0}
 
+    budget, floor = None, args.min_channels
     if args.width:
         channels = args.width
     else:
         budget = parse_count(args.params)
-        channels = size_to_budget(make_cfg, budget)
-        print(f"  parameter budget {budget:,} -> width {channels}")
+        if args.min_channels is None:
+            channels, floor = fit_budget(make_cfg, budget)
+            # The floor only shapes the nerv decoder; siren has no conv blocks.
+            extra = f", channel floor {floor}" if args.arch == "nerv" else ""
+            print(f"  parameter budget {budget:,} -> width {channels}{extra}")
+        else:
+            channels = size_to_budget(lambda w: make_cfg(w, floor), budget)
+            print(f"  parameter budget {budget:,} -> width {channels}")
 
-    cfg = make_cfg(channels)
+    cfg = make_cfg(channels, floor)
     model = build_model(cfg)
     n_params = count_params(model)
+    if budget is not None and n_params > budget:
+        # The channel floor sets a minimum model size that no width can go
+        # under, so a small budget can be unreachable. Say so rather than
+        # quietly handing back something twice the size that was asked for.
+        print(f"  WARNING: {n_params:,} parameters exceeds the {budget:,} budget. "
+              f"The architecture cannot go smaller with a channel floor of "
+              f"{cfg['min_channels']}; lower --min-channels or --strides to fit.")
     print(f"  arch {args.arch}  width {channels}  {n_params:,} parameters "
           f"({human_bytes(n_params * 4)} as fp32)")
 
@@ -696,6 +727,11 @@ def main(argv=None):
                    help="set layer width directly, overriding --params")
     e.add_argument("--depth", type=int, default=4, help="siren hidden layers")
     e.add_argument("--embed-levels", type=int, default=10)
+    e.add_argument("--min-channels", type=int, default=None,
+                   help="floor on nerv block channel counts. Sets the smallest "
+                        "model the architecture can express; higher is better "
+                        "quality but unreachable for small budgets. Chosen "
+                        "automatically from --params when not given")
     e.add_argument("--strides", default="4,4,2",
                    help="nerv upsample factors; their product must divide the "
                         "frame size (default 4,2,2,2 = 32x)")

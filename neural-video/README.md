@@ -109,12 +109,30 @@ instead of block search.
 **But it is not competitive compression, and you should know why before you get
 attached to it:**
 
-- **Rate–distortion.** Run `--compare` and read the table. On a short clip this
-  toy typically needs several times the bits x264 needs for the same PSNR. The
-  serious research versions do far better — HiNeRV and friends land in roughly
-  HEVC/x265 territory on standard test sets — but they are much larger, trained
-  far longer, and still generally trail the best conventional codecs (VVC) and
-  the best learned autoencoder codecs (the DCVC line).
+- **Rate–distortion.** Here is a real measurement from `--compare`, on a
+  deliberately hard 32-frame 96×96 clip (panning texture plus a hard-edged
+  moving square), 147k parameters, 500 epochs:
+
+  | | size | bpp | PSNR |
+  |---|---|---|---|
+  | this codec | 125.4 KB | 3.483 | **30.00 dB** |
+  | x264 crf 18 | 21.1 KB | 0.587 | 29.50 dB |
+  | x264 crf 23 | 12.9 KB | 0.357 | 28.73 dB |
+  | x264 crf 28 | 8.5 KB | 0.236 | 27.50 dB |
+
+  At matched quality that is **5.9× the bytes x264 needs**. The serious research
+  versions do far better — HiNeRV and friends land in roughly HEVC/x265 territory
+  on standard test sets — but they are much larger, trained far longer, and still
+  generally trail the best conventional codecs (VVC) and the best learned
+  autoencoder codecs (the DCVC line). Do not take the table above as the ceiling
+  of the idea; do take it as the ceiling of *this* 700-line version.
+
+- **Short clips are the worst case.** The weights are a fixed cost, and bits per
+  pixel is `file_bytes × 8 / (frames × H × W)`. Spreading one 125 KB model over
+  32 frames is expensive; the same model over 300 frames of similar content costs
+  a tenth the bpp. This is exactly why the NeRV papers train on long sequences,
+  and why a short test clip flatters conventional codecs. If you want this to
+  look its best, give it a long clip that keeps returning to the same content.
 - **Encoding cost is the real problem.** Encoding *is* training. Minutes here,
   hours on a GPU for research configurations, versus x264 running faster than
   real time. Nothing about the approach fixes this; the fit is per-video by
@@ -144,11 +162,12 @@ that reproduces the data), and it is not something to replace H.264 with today.
 
 | flag | effect |
 |---|---|
-| `--params` | the bitrate dial. Parameter budget → layer width → file size. Try `60k`, `200k`, `500k`. |
+| `--params` | the bitrate dial. Parameter budget → layer width → file size. Try `60k`, `200k`, `500k`. A budget below what `--min-channels` allows is reported as a warning, not silently exceeded. |
 | `--epochs` | quality dial. Undertrained is the most common reason results look bad — this is overfitting, so there is no such thing as too much. Start at 600. |
 | `--size` | long side of the frame, snapped to a multiple of the stride product (32 by default). Cost scales with pixels. |
 | `--bits` | weight quantisation. 8 is nearly free; 6 costs a little quality and shrinks the file; 4 usually falls apart. |
 | `--strides` | nerv upsample factors, e.g. `2,2,2,2,2`. Their product sets the base feature map size and must divide the frame dimensions. |
+| `--min-channels` | floor on block widths, and therefore the smallest model the architecture can express: a floor of 16 cannot go below ~66k parameters, 8 reaches ~22k, 4 reaches ~8k. Chosen automatically from `--params` (largest floor that fits, since a high floor also measures better — 30.00 dB vs 29.55 dB at a 150k budget); set it by hand to override. |
 | `--compare` | benchmark against libx264 at matched quality. Use it before believing any compression claim, including this README's. |
 
 Rough guide: a 48-frame 128×128 clip at `--params 200k --epochs 600` takes a
