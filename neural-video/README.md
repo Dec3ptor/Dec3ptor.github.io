@@ -16,7 +16,7 @@ There are two pieces here:
 | | |
 |---|---|
 | `nvc.py` | command-line codec (PyTorch). Real quantisation, real entropy coding, and an `x264` benchmark. |
-| `index.html` | the same idea in the browser (TensorFlow.js). Drop in a video, watch it learn, play it back from the weights. |
+| `index.html` | the same idea in the browser (TensorFlow.js). Drop in a video, watch it learn, play it back from the weights. Quantises to 8 bits after training only — the QAT and progressive work below is CLI-side. |
 
 ---
 
@@ -115,12 +115,13 @@ attached to it:**
 
   | | size | bpp | PSNR |
   |---|---|---|---|
-  | this codec | 125.4 KB | 3.483 | **30.00 dB** |
+  | this codec | 72.4 KB | 2.012 | **29.33 dB** |
   | x264 crf 18 | 21.1 KB | 0.587 | 29.50 dB |
   | x264 crf 23 | 12.9 KB | 0.357 | 28.73 dB |
   | x264 crf 28 | 8.5 KB | 0.236 | 27.50 dB |
 
-  At matched quality that is **5.9× the bytes x264 needs**. The serious research
+  At matched quality that is **3.4× the bytes x264 needs** (it was 5.9× before
+  quantisation-aware training and the 5-bit default; see *Where the bits went*). The serious research
   versions do far better — HiNeRV and friends land in roughly HEVC/x265 territory
   on standard test sets — but they are much larger, trained far longer, and still
   generally trail the best conventional codecs (VVC) and the best learned
@@ -158,6 +159,52 @@ that reproduces the data), and it is not something to replace H.264 with today.
 
 ---
 
+## Where the bits went
+
+Rather than guess at improvements, measure. Three experiments on the clip above,
+all reproducible from this repo.
+
+**1. A better entropy coder is not worth building.** LZMA lands within 2.5% of
+the zeroth-order entropy of the quantised weights (6.965 vs 6.787 bits/weight at
+8 bits). There is almost nothing left for an arithmetic coder to take, which
+kills the most obvious "improvement" before any of it gets written.
+
+**2. Eight bits was wasteful, and quantisation-aware training is what makes low
+bit depths usable.** Rounding weights only *after* training means the network
+never sees the rounding error and cannot compensate. Rounding them in the
+forward pass for the second half of training (with a straight-through estimator
+for the backward pass) changes the picture completely:
+
+| bits | post-training only | with QAT | gain |
+|---|---|---|---|
+| 6 | 29.43 dB / 89.5 KB | 29.54 dB / 90.4 KB | +0.11 dB |
+| 5 | 28.70 dB / 71.6 KB | **29.35 dB / 72.7 KB** | +0.65 dB |
+| 4 | 26.59 dB / 56.5 KB | **28.84 dB / 55.8 KB** | +2.25 dB |
+| 3 | 22.23 dB / 37.4 KB | **27.65 dB / 38.9 KB** | +5.42 dB |
+
+QAT costs nothing at 6 bits and rescues the codec entirely at 3. Together with
+dropping the default from 8 bits to 5, this is a 42% smaller file at 0.3 dB.
+Both are on by default (`--qat-start`, `--bits`).
+
+**3. Per-tensor sensitivity varies ~40×, but mixed precision barely pays.**
+Quantising one tensor at a time to 3 bits and leaving the rest alone:
+
+| tensor | share of weights | dB lost | per % of weights |
+|---|---|---|---|
+| `head.weight` | 0.3% | 0.87 | 2.90 |
+| `fc1.weight` | 0.5% | 1.20 | 2.40 |
+| `fc2.weight` | 7.5% | 2.18 | 0.29 |
+| `blocks.1.weight` | 26.8% | 3.72 | 0.14 |
+| `blocks.0.weight` | 58.6% | 4.28 | 0.07 |
+
+The two smallest tensors are by far the most sensitive per parameter, which
+looks like free money: spend more bits there, they cost almost nothing. In
+practice it is worth about **+0.2 dB at matched rate** — the single-tensor
+measurement overstates it, because once everything is quantised the errors
+compound and no one tensor dominates. Filed under "true but not useful".
+
+---
+
 ## Knobs that matter
 
 | flag | effect |
@@ -165,7 +212,9 @@ that reproduces the data), and it is not something to replace H.264 with today.
 | `--params` | the bitrate dial. Parameter budget → layer width → file size. Try `60k`, `200k`, `500k`. A budget below what `--min-channels` allows is reported as a warning, not silently exceeded. |
 | `--epochs` | quality dial. Undertrained is the most common reason results look bad — this is overfitting, so there is no such thing as too much. Start at 600. |
 | `--size` | long side of the frame, snapped to a multiple of the stride product (32 by default). Cost scales with pixels. |
-| `--bits` | weight quantisation. 8 is nearly free; 6 costs a little quality and shrinks the file; 4 usually falls apart. |
+| `--bits` | weight quantisation, default 5. With QAT even 3 bits stays usable; without it, 4 falls apart. |
+| `--qat-start` | fraction of training after which weights are rounded in the forward pass. Default 0.5. Set to 1.0 to disable and quantise only at the end. |
+| `--progressive` / `--qat-jitter` | write a truncatable file, and train it to survive truncation. See below. |
 | `--strides` | nerv upsample factors, e.g. `2,2,2,2,2`. Their product sets the base feature map size and must divide the frame dimensions. |
 | `--min-channels` | floor on block widths, and therefore the smallest model the architecture can express: a floor of 16 cannot go below ~66k parameters, 8 reaches ~22k, 4 reaches ~8k. Chosen automatically from `--params` (largest floor that fits, since a high floor also measures better — 30.00 dB vs 29.55 dB at a 150k budget); set it by hand to override. |
 | `--compare` | benchmark against libx264 at matched quality. Use it before believing any compression claim, including this README's. |
@@ -173,6 +222,45 @@ that reproduces the data), and it is not something to replace H.264 with today.
 Rough guide: a 48-frame 128×128 clip at `--params 200k --epochs 600` takes a
 couple of minutes on a CPU. Push resolution or frame count and use a GPU
 (`--device cuda`) — it is picked up automatically when present.
+
+---
+
+## A file you can cut in half
+
+`--progressive` writes the weights as bit planes, most significant first,
+instead of one entropy-coded blob. Truncating the file then lowers the bitrate:
+every weight simply loses precision. One encode serves every rate.
+
+```bash
+python nvc.py encode clip.mp4 -o v.nvc --bits 8 --progressive --qat-jitter 4
+python nvc.py truncate v.nvc -o small.nvc --bits 5   # 142.6 KB -> 88.8 KB
+head -c 70000 v.nvc > chopped.nvc                    # even this still decodes
+python nvc.py decode chopped.nvc -o out.mp4
+```
+
+That matters because for an implicit codec *encoding is the expensive part*.
+Serving five bitrates normally means five training runs; here it means five
+calls to `truncate`.
+
+`--qat-jitter N` trains across a range of bit depths rather than one, so the
+weights are reasonable at every truncation point instead of only the trained
+one. What that actually buys, measured:
+
+| planes kept | jitter-trained | plain, truncated | trained at that depth |
+|---|---|---|---|
+| 8 | 29.04 dB | 29.67 dB | — |
+| 6 | 28.82 dB | 28.89 dB | 29.54 dB |
+| 5 | **28.56 dB** | 28.25 dB | 29.35 dB |
+| 4 | **27.46 dB** | 26.38 dB | 28.84 dB |
+
+Read it honestly. Jitter flattens the curve — worth +1.08 dB three planes down —
+but it costs 0.63 dB at full precision, and a purpose-trained model still beats
+the truncated one by more than a dB. The bit-plane layout itself costs a further
+12%, because splitting values into planes throws away exactly the
+value-distribution redundancy that LZMA was living on.
+
+So this is a capability, not a free win: pay ~12% in size and ~1 dB against
+per-rate training, and in exchange never re-encode. Off by default.
 
 ---
 

@@ -35,6 +35,7 @@ import json
 import lzma
 import math
 import os
+import random
 import struct
 import subprocess
 import sys
@@ -46,6 +47,7 @@ import numpy as np
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+import torch.nn.utils.parametrize as parametrize
 
 MAGIC = b"NVC1"
 DEFAULT_STRIDES = (4, 4, 2)  # 32x total upsample from the base feature map
@@ -275,9 +277,80 @@ def size_to_budget(make_cfg, target_params: int, lo=8, hi=1024) -> int:
     return best
 
 
+# ------------------------------------------------- quantisation-aware training
+
+class _RoundSTE(torch.autograd.Function):
+    """Quantise to a uniform grid on the forward pass, pass gradients through.
+
+    Rounding has zero gradient almost everywhere, so a network trained in fp32
+    and quantised afterwards has never seen the rounding error and cannot
+    compensate for it. The straight-through estimator pretends the rounding is
+    the identity during the backward pass, which lets the weights settle into
+    positions where the grid costs little.
+    """
+
+    @staticmethod
+    def forward(ctx, w, levels):
+        lo, hi = w.min(), w.max()
+        scale = (hi - lo) / levels
+        if float(scale) <= 0:
+            return w
+        return torch.round((w - lo) / scale).clamp_(0, levels) * scale + lo
+
+    @staticmethod
+    def backward(ctx, grad):
+        return grad, None
+
+
+class FakeQuantize(nn.Module):
+    """Round to `bits`, or to a random depth in [bits - jitter, bits].
+
+    Jitter is what makes a truncatable file worth having. Trained at one fixed
+    depth, a network is only good at that depth, so chopping bit planes off the
+    end degrades it faster than necessary. Sampling the depth each step asks the
+    weights to be simultaneously reasonable at every precision, which is what a
+    file you can cut anywhere actually needs.
+    """
+
+    def __init__(self, bits: int, jitter: int = 0):
+        super().__init__()
+        self.bits = bits
+        self.jitter = jitter
+
+    def forward(self, w):
+        b = self.bits
+        if self.jitter and self.training:
+            b = random.randint(max(2, self.bits - self.jitter), self.bits)
+        return _RoundSTE.apply(w, (1 << b) - 1)
+
+
+def _quantisable(model):
+    return [m for m in model.modules()
+            if isinstance(m, (nn.Linear, nn.Conv2d)) and m.weight.dim() >= 2]
+
+
+def enable_qat(model, bits: int, jitter: int = 0):
+    """Make every weight matrix read back quantised, in place."""
+    for m in _quantisable(model):
+        parametrize.register_parametrization(m, "weight",
+                                             FakeQuantize(bits, jitter))
+
+
+def finalise_qat(model):
+    """Bake the quantised values in and restore plain .weight parameters."""
+    # Baking runs the parametrisation once more, so make sure jitter is off:
+    # otherwise the stored weights land at a random depth rather than the full
+    # one the file claims to hold.
+    model.eval()
+    for m in _quantisable(model):
+        if parametrize.is_parametrized(m, "weight"):
+            parametrize.remove_parametrizations(m, "weight", leave_parametrized=True)
+
+
 # --------------------------------------------------------------- training
 
-def train_nerv(model, clip_u8, *, epochs, batch, lr, device, quiet=False):
+def train_nerv(model, clip_u8, *, epochs, batch, lr, device, quiet=False,
+               qat_bits=None, qat_start=None, qat_jitter=0):
     T = clip_u8.shape[0]
     target = torch.from_numpy(clip_u8).permute(0, 3, 1, 2).float().div_(255.0)
     times = torch.arange(T, dtype=torch.float32) / max(T - 1, 1)
@@ -290,6 +363,12 @@ def train_nerv(model, clip_u8, *, epochs, batch, lr, device, quiet=False):
 
     t0, last = time.time(), 0.0
     for epoch in range(epochs):
+        if qat_bits and qat_start is not None and epoch == qat_start:
+            enable_qat(model, qat_bits, qat_jitter)
+            if not quiet:
+                depth = (f"{max(2, qat_bits - qat_jitter)}-{qat_bits}"
+                         if qat_jitter else str(qat_bits))
+                print(f"\n  -> quantisation-aware training at {depth} bits")
         order = torch.randperm(T)
         running = 0.0
         for i in range(0, T, batch):
@@ -311,7 +390,8 @@ def train_nerv(model, clip_u8, *, epochs, batch, lr, device, quiet=False):
     return last
 
 
-def train_siren(model, clip_u8, *, epochs, batch, lr, device, quiet=False):
+def train_siren(model, clip_u8, *, epochs, batch, lr, device, quiet=False,
+                qat_bits=None, qat_start=None, qat_jitter=0):
     T, H, W, _ = clip_u8.shape
     flat = torch.from_numpy(clip_u8.reshape(-1, 3)).float().div_(255.0)
     n_px = flat.shape[0]
@@ -328,6 +408,12 @@ def train_siren(model, clip_u8, *, epochs, batch, lr, device, quiet=False):
                          dtype=torch.float32)
     t0, last = time.time(), 0.0
     for epoch in range(epochs):
+        if qat_bits and qat_start is not None and epoch == qat_start:
+            enable_qat(model, qat_bits, qat_jitter)
+            if not quiet:
+                depth = (f"{max(2, qat_bits - qat_jitter)}-{qat_bits}"
+                         if qat_jitter else str(qat_bits))
+                print(f"\n  -> quantisation-aware training at {depth} bits")
         running = 0.0
         for _ in range(per_epoch):
             idx = torch.randint(0, n_px, (batch,))
@@ -442,6 +528,115 @@ def dequantize_state(meta, blob: bytes):
     return state
 
 
+# ------------------------------------------------- progressive (truncatable)
+
+MAGIC_PROG = b"NVCP"
+
+
+def encode_progressive(state_dict, bits: int = 8):
+    """Split the weights into a small base plus bit planes, most significant
+    first.
+
+    A normal codec file is all-or-nothing: cut it short and it stops decoding.
+    Ordering the weight bits by significance instead makes the file
+    *truncatable* - chop bytes off the end and every weight simply loses
+    precision, so one training run yields a whole rate-distortion curve.
+
+    This is affordable precisely because entropy coding buys so little on these
+    weights (LZMA lands within ~2.5%% of their zeroth-order entropy), so giving
+    up whole-blob context to compress plane by plane costs very little.
+    """
+    meta, params, base_1d, weights = [], [], bytearray(), []
+    for name, tensor in state_dict.items():
+        arr = tensor.detach().cpu().numpy().astype(np.float32).ravel()
+        lo, hi = float(arr.min()), float(arr.max())
+        levels = (1 << bits) - 1
+        scale = float(np.float32((hi - lo) / levels)) if hi > lo else 1.0
+        q = np.rint((arr - lo) / scale).clip(0, levels).astype(np.uint8)
+        is_w = tensor.dim() >= 2
+        meta.append({"name": name, "shape": list(tensor.shape), "w": is_w})
+        params.append((lo, scale))
+        if is_w:
+            weights.append(q)
+        else:
+            base_1d.extend(q.tobytes())
+
+    qw = np.concatenate(weights) if weights else np.zeros(0, np.uint8)
+    # Biases stay at full precision in the base: they are a fraction of a
+    # percent of the parameters but truncating them hurts out of proportion.
+    base = np.asarray(params, dtype="<f4").tobytes() + bytes(base_1d)
+    planes = [lzma.compress(np.packbits((qw >> p) & 1).tobytes(),
+                            preset=9 | lzma.PRESET_EXTREME)
+              for p in range(bits - 1, -1, -1)]
+    return meta, base, planes, int(qw.size)
+
+
+def decode_progressive(meta, base: bytes, planes, n_weights: int, bits: int):
+    """Rebuild a state dict from however many bit planes actually arrived."""
+    params = np.frombuffer(base, dtype="<f4", count=2 * len(meta)).reshape(-1, 2)
+    off_1d = 8 * len(meta)
+
+    q = np.zeros(n_weights, dtype=np.int32)
+    for i, plane in enumerate(planes):
+        raw = np.frombuffer(lzma.decompress(plane), dtype=np.uint8)
+        bit = np.unpackbits(raw)[:n_weights].astype(np.int32)
+        q |= bit << (bits - 1 - i)
+    if len(planes) < bits:
+        # Everything below the last plane received is unknown; sit in the
+        # middle of that interval rather than at its floor, which would bias
+        # every weight downwards.
+        q += (1 << (bits - len(planes))) // 2
+
+    state, w_off = {}, 0
+    for t, (lo, scale) in zip(meta, params):
+        n = math.prod(t["shape"]) if t["shape"] else 1
+        if t["w"]:
+            vals = q[w_off:w_off + n].astype(np.float32)
+            w_off += n
+        else:
+            vals = np.frombuffer(base, dtype=np.uint8, count=n,
+                                 offset=off_1d).astype(np.float32)
+            off_1d += n
+        arr = vals * float(scale) + float(lo)
+        state[t["name"]] = torch.from_numpy(arr.reshape(t["shape"]).copy())
+    return state
+
+
+def save_progressive(path, header: dict, base: bytes, planes) -> int:
+    header = dict(header, base_len=len(base), plane_lens=[len(p) for p in planes])
+    hdr = json.dumps(header, separators=(",", ":")).encode()
+    with open(path, "wb") as f:
+        f.write(MAGIC_PROG)
+        f.write(struct.pack("<I", len(hdr)))
+        f.write(hdr)
+        f.write(base)
+        for plane in planes:
+            f.write(plane)
+    return os.path.getsize(path)
+
+
+def load_progressive(path):
+    """Load a progressive file, tolerating one that has been cut short."""
+    data = open(path, "rb").read()
+    if data[:4] != MAGIC_PROG:
+        raise SystemExit(f"{path} is not a progressive .nvc file")
+    (hlen,) = struct.unpack("<I", data[4:8])
+    header = json.loads(data[8:8 + hlen].decode())
+    off = 8 + hlen
+    base = data[off:off + header["base_len"]]
+    if len(base) < header["base_len"]:
+        raise SystemExit(f"{path} is truncated past the point of being usable: "
+                         f"the base layer needs {header['base_len']} bytes")
+    off += header["base_len"]
+    planes = []
+    for n in header["plane_lens"]:
+        if off + n > len(data):
+            break                      # the file was cut here; stop cleanly
+        planes.append(data[off:off + n])
+        off += n
+    return header, base, planes
+
+
 def save_nvc(path, header: dict, blob: bytes) -> int:
     # 8-bit weights are close to incompressible, so LZMA sometimes *costs*
     # bytes. Keep whichever is smaller and record which one we used.
@@ -469,6 +664,20 @@ def load_nvc(path):
         payload = f.read()
     blob = lzma.decompress(payload) if header.get("codec", "lzma") == "lzma" else payload
     return header, blob
+
+
+def load_any(path):
+    """Open either container. Returns (header, model, planes_present)."""
+    with open(path, "rb") as f:
+        magic = f.read(4)
+    if magic == MAGIC_PROG:
+        header, base, planes = load_progressive(path)
+        model = build_model(header["config"])
+        model.load_state_dict(decode_progressive(
+            header["tensors"], base, planes, header["n_weights"], header["bits"]))
+        return header, model, len(planes)
+    header, blob = load_nvc(path)
+    return header, model_from_nvc(header, blob), None
 
 
 def model_from_nvc(header, blob):
@@ -620,21 +829,33 @@ def cmd_encode(args):
     # A "batch" means different things per architecture: whole frames for nerv,
     # individual pixel samples for siren.
     batch = args.batch or (4 if args.arch == "nerv" else 16384)
+    qat_start = (None if args.qat_start >= 1.0
+                 else max(1, int(args.epochs * args.qat_start)))
     print(f"training on {device} for {args.epochs} epochs (batch {batch})")
     trainer = train_nerv if args.arch == "nerv" else train_siren
     trainer(model, clip, epochs=args.epochs, batch=batch, lr=args.lr,
-            device=device, quiet=args.quiet)
+            device=device, quiet=args.quiet,
+            qat_bits=args.bits, qat_start=qat_start,
+            qat_jitter=args.qat_jitter)
+    finalise_qat(model)
 
     recon_fp32 = render(model, cfg, device=device)
     psnr_fp32 = psnr_u8(clip, recon_fp32)
 
-    tensors, blob = quantize_state(model.state_dict(), args.bits)
-    header = {"version": 1, "config": cfg, "tensors": tensors,
-              "params": n_params, "bits": args.bits}
-    total = save_nvc(args.output, header, blob)
+    if args.progressive:
+        tensors, base, planes, n_w = encode_progressive(model.state_dict(), args.bits)
+        header = {"version": 1, "config": cfg, "tensors": tensors,
+                  "params": n_params, "bits": args.bits, "n_weights": n_w}
+        total = save_progressive(args.output, header, base, planes)
+        blob = base + b"".join(planes)
+    else:
+        tensors, blob = quantize_state(model.state_dict(), args.bits)
+        header = {"version": 1, "config": cfg, "tensors": tensors,
+                  "params": n_params, "bits": args.bits}
+        total = save_nvc(args.output, header, blob)
 
     # Re-render from the *quantised* weights: that is what a decoder will see.
-    model_q = model_from_nvc(*load_nvc(args.output))
+    model_q = load_any(args.output)[1]
     recon = render(model_q, cfg, device=device)
     psnr_q = psnr_u8(clip, recon)
 
@@ -648,9 +869,13 @@ def cmd_encode(args):
           f"({human_bytes(raw_bytes)} -> {human_bytes(total)})")
     print(f"  vs source file    {src_bytes / total:.2f}x "
           f"({human_bytes(src_bytes)}, note: different resolution/length)")
-    codec = load_nvc(args.output)[0].get("codec")
-    print(f"  entropy coding    {len(blob):,} B of quantised weights -> "
-          f"{total:,} B on disk ({codec})")
+    if args.progressive:
+        print(f"  layout            {args.bits} bit planes, most significant "
+              f"first - truncating the file lowers the rate")
+    else:
+        codec = load_nvc(args.output)[0].get("codec")
+        print(f"  entropy coding    {len(blob):,} B of quantised weights -> "
+              f"{total:,} B on disk ({codec})")
 
     if args.preview:
         side = np.concatenate([clip, recon], axis=2)
@@ -663,9 +888,11 @@ def cmd_encode(args):
 
 def cmd_decode(args):
     device = pick_device(args.device)
-    header, blob = load_nvc(args.input)
+    header, model, planes = load_any(args.input)
     cfg = header["config"]
-    model = model_from_nvc(header, blob)
+    if planes is not None and planes < header["bits"]:
+        print(f"  file carries {planes} of {header['bits']} bit planes; decoding "
+              f"at reduced precision")
     n_frames = args.frames or cfg["frames"]
     # Keeping the source frame rate means asking for more frames stretches the
     # clip out: the network is sampled between the times it was trained on.
@@ -684,7 +911,7 @@ def cmd_decode(args):
 
 
 def cmd_info(args):
-    header, blob = load_nvc(args.input)
+    header, _, planes = load_any(args.input)
     cfg = header["config"]
     size = os.path.getsize(args.input)
     px = cfg["frames"] * cfg["height"] * cfg["width"]
@@ -696,6 +923,23 @@ def cmd_info(args):
     print(f"  file size       {human_bytes(size)} ({size:,} bytes)")
     print(f"  bits per pixel  {size * 8 / px:.4f}")
     print(f"  vs raw RGB      {px * 3 / size:.1f}x smaller")
+    if planes is not None:
+        print(f"  bit planes      {planes} of {header['bits']} present"
+              f"{' (truncated)' if planes < header['bits'] else ''}")
+
+
+def cmd_truncate(args):
+    header, base, planes = load_progressive(args.input)
+    keep = min(args.bits, len(planes))
+    if keep < 1:
+        raise SystemExit("keep at least one bit plane")
+    before = os.path.getsize(args.input)
+    total = save_progressive(args.output, header, base, planes[:keep])
+    print(f"{args.input} -> {args.output}")
+    print(f"  bit planes  {len(planes)} -> {keep}")
+    print(f"  size        {human_bytes(before)} -> {human_bytes(total)} "
+          f"({total / before * 100:.0f}%)")
+    print("  no retraining: the same encode serves every rate")
 
 
 def main(argv=None):
@@ -740,9 +984,23 @@ def main(argv=None):
                    help="frames per step (nerv, default 4) or pixels per step "
                         "(siren, default 16384)")
     e.add_argument("--lr", type=float, default=2e-3)
-    e.add_argument("--bits", type=int, default=8, help="weight quantisation")
+    e.add_argument("--bits", type=int, default=5,
+                   help="weight quantisation. With QAT, 5 bits measured 29.35 dB "
+                        "in 72.7 KB against 8 bits at 29.67 dB in 125.1 KB on "
+                        "the same clip, so it is the default")
+    e.add_argument("--qat-jitter", type=int, default=0,
+                   help="train across a range of bit depths rather than one, "
+                        "so a progressive file stays good when truncated")
+    e.add_argument("--qat-start", type=float, default=0.5,
+                   help="fraction of training after which weights are rounded "
+                        "in the forward pass, so the network can adapt to the "
+                        "quantisation grid. 1.0 disables it")
     e.add_argument("--preview", default=None,
                    help="write a side-by-side original|reconstruction video")
+    e.add_argument("--progressive", action="store_true",
+                   help="write bit planes most-significant-first so the file "
+                        "can be truncated to any lower rate without retraining. "
+                        "Costs about 12%% in size; pair with --qat-jitter")
     e.add_argument("--compare", action="store_true",
                    help="benchmark against libx264 on the same frames")
     e.add_argument("--device", default="auto")
@@ -760,12 +1018,19 @@ def main(argv=None):
     c.add_argument("--device", default="auto")
     c.set_defaults(func=cmd_decode)
 
+    tr = sub.add_parser("truncate", help="lower the rate of a progressive file")
+    tr.add_argument("input")
+    tr.add_argument("-o", "--output", default="truncated.nvc")
+    tr.add_argument("--bits", type=int, required=True,
+                    help="how many bit planes to keep")
+    tr.set_defaults(func=cmd_truncate)
+
     i = sub.add_parser("info", help="describe an .nvc file")
     i.add_argument("input")
     i.set_defaults(func=cmd_info)
 
     args = p.parse_args(argv)
-    if getattr(args, "bits", 8) not in range(2, 17):
+    if args.cmd == "encode" and args.bits not in range(2, 17):
         p.error("--bits must be between 2 and 16")
     args.func(args)
 
