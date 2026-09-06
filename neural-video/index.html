@@ -106,6 +106,13 @@
         </select>
       </div>
       <div>
+        <label for="arch">architecture</label>
+        <select id="arch">
+          <option value="nerv" selected>nerv (MLP stem)</option>
+          <option value="grid">grid (stored frames)</option>
+        </select>
+      </div>
+      <div>
         <label for="epochs">epochs</label>
         <select id="epochs">
           <option value="100">100 (fast)</option>
@@ -154,17 +161,23 @@
   <h2>What is actually happening</h2>
   <div class="panel note">
     <p style="margin-top:0">
-      The network is <code>f(t) &rarr; frame</code>: a timestamp goes through a Fourier
-      feature embedding and a small MLP, which produces a low-resolution feature map;
-      convolution + pixel-shuffle blocks upsample that 32&times; into RGB. Training is
-      pure overfitting on a single clip — there is no dataset and no generalisation.
-      Afterwards the weights are quantised to 8 bits per value, which is what the
-      reported file size measures.
+      The network is <code>f(t) &rarr; frame</code>, and the two architectures differ
+      only in where the per-frame code comes from. <b>nerv</b> generates it: the
+      timestamp goes through a Fourier feature embedding and a small MLP that
+      produces a low-resolution feature map. <b>grid</b> stores it instead, as a
+      learned stack of feature maps interpolated in time, plus a second finer grid
+      injected partway up the decoder. Either way, convolution + pixel-shuffle
+      blocks upsample 32&times; into RGB, and training is pure overfitting on one
+      clip — no dataset, no generalisation. The weights are then quantised to
+      8 bits, which is what the reported size measures.
     </p>
     <p style="margin-bottom:0">
-      This is the NeRV family of implicit neural representations. There is a
-      command-line version with proper entropy coding and an
-      <code>x264</code> benchmark in <code>nvc.py</code> next to this page.
+      Which architecture wins depends on the footage: at a matched parameter
+      budget, grid measured 2.43 dB ahead on a textured pan and 1.36 dB behind on
+      smooth gradients, so try both. The command-line version next to this page
+      (<code>nvc.py</code>) adds quantisation-aware training, a truncatable
+      bitstream, and an <code>x264</code> benchmark that is honest about how far
+      off this all still is — roughly 6 to 8 times the bytes at matched quality.
     </p>
   </div>
 
@@ -178,6 +191,7 @@
 const $ = id => document.getElementById(id);
 const STRIDES = [4, 4, 2];             // 32x total upsample
 const UP = STRIDES.reduce((a, b) => a * b, 1);
+const EMBED_LEVELS = 10;  // Fourier bands for the nerv time embedding
 const MID_LEVEL = 1;      // decoder block the finer grid feeds
 const GRID_SHARE = 0.45;  // of the budget, spent on the finer grid
 const QUANT_BITS = 8;
@@ -226,9 +240,10 @@ function progress(p) { $("prog").style.width = `${Math.round(p * 100)}%`; }
 // ------------------------------------------------------------- the network
 
 class TinyNeRV {
-  constructor(h, w, channels, minCh, gridFrames, midCh) {
+  constructor(h, w, channels, minCh, gridFrames, midCh, useGrid) {
     this.h = h; this.w = w; this.channels = channels;
     this.minCh = minCh; this.gridFrames = gridFrames; this.midCh = midCh || 0;
+    this.useGrid = !!useGrid;
     this.bh = h / UP; this.bw = w / UP;
     this.vars = [];
 
@@ -237,10 +252,21 @@ class TinyNeRV {
     // one frame from the next through a handful of weights; measured on the
     // command-line version, storing it instead is worth about 2.4 dB at a
     // matched parameter budget.
-    this.baseGrid = this._grid([gridFrames, this.bh, this.bw, channels]);
-    this.midGrid = this.midCh
-      ? this._grid([gridFrames, this.bh * STRIDES[0], this.bw * STRIDES[0], this.midCh])
-      : null;
+    if (this.useGrid) {
+      this.baseGrid = this._grid([gridFrames, this.bh, this.bw, channels]);
+      this.midGrid = this.midCh
+        ? this._grid([gridFrames, this.bh * STRIDES[0], this.bw * STRIDES[0], this.midCh])
+        : null;
+    } else {
+      this.midCh = 0;
+      this.W1 = this._lin([2 * EMBED_LEVELS, channels]);
+      this.b1 = this._zeros([channels]);
+      const fcOut = channels * this.bh * this.bw;
+      this.W2 = this._lin([channels, fcOut]);
+      this.b2 = this._zeros([fcOut]);
+      this.freqs = tf.keep(tf.tensor1d(
+        Array.from({ length: EMBED_LEVELS }, (_, i) => Math.pow(2, i) * Math.PI)));
+    }
 
     this.convs = [];
     let c = channels;
@@ -284,10 +310,19 @@ class TinyNeRV {
   // t: [B, 1] in [0,1]  ->  [B, h, w, 3] in [0,1]
   forward(t) {
     return tf.tidy(() => {
-      let x = this.sampleTime(this.baseGrid, t);
+      let x;
+      if (this.useGrid) {
+        x = this.sampleTime(this.baseGrid, t);
+      } else {
+        const ang = tf.mul(t, this.freqs.expandDims(0));
+        const emb = tf.concat([tf.sin(ang), tf.cos(ang)], 1);
+        x = gelu(tf.add(tf.matMul(emb, this.W1), this.b1));
+        x = tf.add(tf.matMul(x, this.W2), this.b2);
+        x = tf.reshape(x, [-1, this.bh, this.bw, this.channels]);
+      }
       for (let i = 0; i < this.convs.length; i++) {
         const { W, b, s } = this.convs[i];
-        if (i === MID_LEVEL && this.midGrid) {
+        if (i === MID_LEVEL && this.useGrid && this.midGrid) {
           x = tf.concat([x, this.sampleTime(this.midGrid, t)], 3);
         }
         x = tf.add(tf.conv2d(x, W, 1, "same"), b);
@@ -329,13 +364,19 @@ class TinyNeRV {
     });
   }
 
-  dispose() { this.vars.forEach(v => v.dispose()); }
+  dispose() { this.vars.forEach(v => v.dispose()); if (this.freqs) this.freqs.dispose(); }
 }
 
-function paramCountFor(h, w, c, minCh, gridFrames, midCh) {
+function paramCountFor(h, w, c, minCh, gridFrames, midCh, useGrid) {
   const bh = h / UP, bw = w / UP;
-  let n = gridFrames * bh * bw * c;
-  if (midCh) n += gridFrames * (bh * STRIDES[0]) * (bw * STRIDES[0]) * midCh;
+  let n;
+  if (useGrid) {
+    n = gridFrames * bh * bw * c;
+    if (midCh) n += gridFrames * (bh * STRIDES[0]) * (bw * STRIDES[0]) * midCh;
+  } else {
+    n = 2 * EMBED_LEVELS * c + c + c * (c * bh * bw) + c * bh * bw;
+    midCh = 0;
+  }
   let cc = c;
   STRIDES.forEach((s, i) => {
     const cIn = cc + (i === MID_LEVEL ? midCh : 0);
@@ -349,7 +390,7 @@ function paramCountFor(h, w, c, minCh, gridFrames, midCh) {
 /** Pick the finer grid's size, a channel floor and a layer width for a budget.
  *  The finer grid is a fixed cost the width search cannot trade against, so it
  *  is sized from the budget first and the decoder takes what is left. */
-function fitBudget(h, w, budget) {
+function fitBudget(h, w, budget, useGrid) {
   const bh = h / UP, bw = w / UP;
   const gridFrames = clip ? clip.n : 32;
   const midSlots = gridFrames * (bh * STRIDES[0]) * (bw * STRIDES[0]);
@@ -357,21 +398,21 @@ function fitBudget(h, w, budget) {
     let lo = 4, hi = 512, best = 4;
     while (lo <= hi) {
       const mid = (lo + hi) >> 1;
-      if (paramCountFor(h, w, mid, minCh, gridFrames, midCh) <= budget) {
+      if (paramCountFor(h, w, mid, minCh, gridFrames, midCh, useGrid) <= budget) {
         best = mid; lo = mid + 1;
       } else { hi = mid - 1; }
     }
     return best;
   };
-  let midCh = Math.max(1, Math.floor(GRID_SHARE * budget / midSlots));
+  let midCh = useGrid ? Math.max(1, Math.floor(GRID_SHARE * budget / midSlots)) : 0;
   for (;;) {
     for (const minCh of CHANNEL_FLOORS) {
       const c = widest(minCh, midCh);
-      if (paramCountFor(h, w, c, minCh, gridFrames, midCh) <= budget) {
+      if (paramCountFor(h, w, c, minCh, gridFrames, midCh, useGrid) <= budget) {
         return { channels: c, minCh, gridFrames, midCh };
       }
     }
-    if (midCh <= 1) break;
+    if (midCh <= 1 || !useGrid) break;
     midCh = midCh > 4 ? Math.floor(midCh * 0.8) : midCh - 1;
   }
   const minCh = CHANNEL_FLOORS[CHANNEL_FLOORS.length - 1];
@@ -473,8 +514,10 @@ async function train() {
   const budget = +$("budget").value;
 
   if (net) net.dispose();
-  const { channels, minCh, gridFrames, midCh } = fitBudget(clip.h, clip.w, budget);
-  net = new TinyNeRV(clip.h, clip.w, channels, minCh, gridFrames, midCh);
+  const useGrid = $("arch").value === "grid";
+  const { channels, minCh, gridFrames, midCh } =
+    fitBudget(clip.h, clip.w, budget, useGrid);
+  net = new TinyNeRV(clip.h, clip.w, channels, minCh, gridFrames, midCh, useGrid);
   const nParams = net.paramCount();
 
   const target = targetTensor(clip);
@@ -628,7 +671,7 @@ function packWeights(blobs) {
   const header = JSON.stringify({
     magic: "NVCW1", w: clip.w, h: clip.h, n: clip.n, fps: clip.fps,
     channels: net.channels, minCh: net.minCh, gridFrames: net.gridFrames,
-    midCh: net.midCh, bits: QUANT_BITS, tensors: meta,
+    midCh: net.midCh, useGrid: net.useGrid, bits: QUANT_BITS, tensors: meta,
   });
   const hb = new TextEncoder().encode(header);
   const total = 4 + hb.length + blobs.reduce((a, b) => a + b.q.length, 0);
@@ -716,7 +759,7 @@ $("loadw").addEventListener("change", async e => {
     const { header, blobs } = unpackWeights(new Uint8Array(await f.arrayBuffer()));
     if (net) net.dispose();
     net = new TinyNeRV(header.h, header.w, header.channels, header.minCh,
-                       header.gridFrames, header.midCh);
+                       header.gridFrames, header.midCh, header.useGrid);
     net.loadBlobs(blobs);
     clip = {
       frames: Array.from({ length: header.n }, () => new Float32Array(header.w * header.h * 3)),

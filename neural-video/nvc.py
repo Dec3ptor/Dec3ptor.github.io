@@ -822,8 +822,17 @@ def model_from_nvc(header, blob):
 
 # ------------------------------------------------------- x264 baseline
 
-def x264_roundtrip(frames: np.ndarray, fps: float, crf: int, preset="veryslow"):
-    """Encode with libx264 at a given CRF and decode back. -> (bytes, psnr)."""
+def x264_roundtrip(frames: np.ndarray, fps: float, crf: int, preset="veryslow",
+                   pix_fmt="yuv444p"):
+    """Encode with libx264 at a given CRF and decode back. -> (bytes, psnr).
+
+    yuv444p, not the usual yuv420p, because this codec reconstructs full RGB
+    and the comparison is scored in RGB. On a chroma-rich clip 4:2:0 throws
+    away three quarters of the colour before x264 sees it, which caps its PSNR
+    no matter how many bits it spends - measured at 30.25 dB even at crf 0,
+    below what the network reaches. Comparing against that number flatters this
+    codec badly. Pass --compare-pix yuv420p for the deployment-realistic figure.
+    """
     T, H, W, _ = frames.shape
     exe = ffmpeg_exe()
     with tempfile.TemporaryDirectory() as td:
@@ -833,7 +842,7 @@ def x264_roundtrip(frames: np.ndarray, fps: float, crf: int, preset="veryslow"):
              "-f", "rawvideo", "-pix_fmt", "rgb24", "-s", f"{W}x{H}",
              "-r", f"{fps:g}", "-i", "-",
              "-c:v", "libx264", "-preset", preset, "-crf", str(crf),
-             "-pix_fmt", "yuv420p", out],
+             "-pix_fmt", pix_fmt, out],
             input=frames.tobytes(), capture_output=True)
         if enc.returncode != 0:
             raise RuntimeError(enc.stderr.decode()[-2000:])
@@ -850,16 +859,17 @@ def x264_roundtrip(frames: np.ndarray, fps: float, crf: int, preset="veryslow"):
     return size, psnr_u8(frames, got)
 
 
-def compare_with_x264(frames, fps, neural_bytes, neural_psnr, crfs=None):
-    crfs = crfs or [18, 23, 28, 33, 38, 43, 48, 51]
-    print("\n  libx264 on the exact same frames (preset veryslow, yuv420p):")
+def compare_with_x264(frames, fps, neural_bytes, neural_psnr, crfs=None,
+                      pix_fmt="yuv444p"):
+    crfs = crfs or [8, 12, 16, 20, 23, 26, 30, 35, 40, 45, 51]
+    print(f"\n  libx264 on the exact same frames (preset veryslow, {pix_fmt}):")
     print(f"    {'crf':>4} {'size':>12} {'bpp':>8} {'psnr':>8}")
     T, H, W, _ = frames.shape
     px = T * H * W
     rows = []
     for crf in crfs:
         try:
-            size, p = x264_roundtrip(frames, fps, crf)
+            size, p = x264_roundtrip(frames, fps, crf, pix_fmt=pix_fmt)
         except Exception as exc:
             print(f"    crf {crf}: failed ({exc})")
             continue
@@ -867,14 +877,30 @@ def compare_with_x264(frames, fps, neural_bytes, neural_psnr, crfs=None):
         print(f"    {crf:>4} {human_bytes(size):>12} {size * 8 / px:>8.3f} {p:>7.2f} dB")
     if not rows:
         return
-    # The fair question: at the PSNR our network reached, how big is x264?
-    crf, size, p = min(rows, key=lambda r: abs(r[2] - neural_psnr))
-    print(f"\n    closest x264 quality: crf {crf} -> {p:.2f} dB in {human_bytes(size)}")
-    print(f"    this codec:                    {neural_psnr:.2f} dB in {human_bytes(neural_bytes)}")
-    ratio = neural_bytes / size if size else float("inf")
-    verdict = ("x264 wins" if ratio > 1.05 else
-               "this codec wins" if ratio < 0.95 else "roughly a tie")
-    print(f"    -> {ratio:.2f}x the size of x264 at matched quality ({verdict})")
+    rows.sort(key=lambda r: r[2])
+    lo, hi = rows[0], rows[-1]
+    print(f"\n    this codec: {neural_psnr:.2f} dB in {human_bytes(neural_bytes)}")
+    if not (lo[2] <= neural_psnr <= hi[2]):
+        # Picking the "nearest" point outside the bracket compares different
+        # qualities and reports a meaningless ratio.
+        end = "above" if neural_psnr > hi[2] else "below"
+        print(f"    x264 never reaches this quality here: its range is "
+              f"{lo[2]:.2f}-{hi[2]:.2f} dB, and we are {end} it.")
+        print(f"    No matched-quality comparison is possible - widen --compare-crfs.")
+        return
+    # Interpolate along the rate-distortion curve; rate grows roughly
+    # exponentially in quality, so interpolate the log of the size.
+    for (c0, s0, p0), (c1, s1, p1) in zip(rows, rows[1:]):
+        if p0 <= neural_psnr <= p1:
+            f = 0.0 if p1 == p0 else (neural_psnr - p0) / (p1 - p0)
+            size = math.exp(math.log(s0) + f * (math.log(s1) - math.log(s0)))
+            print(f"    x264 at the same {neural_psnr:.2f} dB: "
+                  f"{human_bytes(size)} (between crf {c1} and crf {c0})")
+            ratio = neural_bytes / size
+            verdict = ("x264 wins" if ratio > 1.05 else
+                       "this codec wins" if ratio < 0.95 else "roughly a tie")
+            print(f"    -> {ratio:.2f}x the size of x264 at matched quality ({verdict})")
+            return
 
 
 # ------------------------------------------------------------ demo content
@@ -1044,7 +1070,7 @@ def cmd_encode(args):
         print(f"  preview           {args.preview} (original | reconstruction)")
 
     if args.compare:
-        compare_with_x264(clip, fps, total, psnr_q)
+        compare_with_x264(clip, fps, total, psnr_q, pix_fmt=args.compare_pix)
 
 
 def cmd_decode(args):
@@ -1119,10 +1145,12 @@ def main(argv=None):
     e = sub.add_parser("encode", help="overfit a network to a video")
     e.add_argument("input")
     e.add_argument("-o", "--output", default="out.nvc")
-    e.add_argument("--arch", choices=("nerv", "grid", "siren"), default="grid",
-                   help="grid stores per-frame feature maps directly; nerv "
-                        "generates them from an MLP over a Fourier embedding "
-                        "of the timestamp")
+    e.add_argument("--arch", choices=("nerv", "grid", "siren"), default="nerv",
+                   help="nerv generates per-frame feature maps from an MLP over "
+                        "a Fourier embedding of the timestamp; grid stores them "
+                        "directly. Which wins depends on the footage - grid "
+                        "measured +2.43 dB on a textured pan, nerv +1.36 dB on "
+                        "smooth content, at a matched budget. Try both")
     e.add_argument("--grid-frames", type=int, default=0,
                    help="temporal resolution of the base grid (0 = one slice "
                         "per frame). Fewer slices means fewer parameters and "
@@ -1182,6 +1210,11 @@ def main(argv=None):
                    help="write bit planes most-significant-first so the file "
                         "can be truncated to any lower rate without retraining. "
                         "Costs about 12%% in size; pair with --qat-jitter")
+    e.add_argument("--compare-pix", default="yuv444p",
+                   choices=("yuv444p", "yuv420p"),
+                   help="pixel format for the x264 baseline. yuv444p matches "
+                        "this codec's full-colour output; yuv420p is what real "
+                        "deployments ship but caps PSNR scored in RGB")
     e.add_argument("--compare", action="store_true",
                    help="benchmark against libx264 on the same frames")
     e.add_argument("--device", default="auto")

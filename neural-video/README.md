@@ -113,15 +113,21 @@ attached to it:**
   deliberately hard 32-frame 96×96 clip (panning texture plus a hard-edged
   moving square), 147k parameters, 500 epochs:
 
-  | | size | bpp | PSNR |
+  | | size | PSNR | vs x264 at the same PSNR |
   |---|---|---|---|
-  | this codec | 72.4 KB | 2.012 | **29.33 dB** |
-  | x264 crf 18 | 21.1 KB | 0.587 | 29.50 dB |
-  | x264 crf 23 | 12.9 KB | 0.357 | 28.73 dB |
-  | x264 crf 28 | 8.5 KB | 0.236 | 27.50 dB |
+  | textured pan (`--arch grid`) | 74.7 KB | 31.71 dB | 11.8 KB → **6.4×** |
+  | smooth clip (`--arch nerv`) | 70.3 KB | 33.15 dB | 8.3 KB → **8.5×** |
 
-  At matched quality that is **3.4× the bytes x264 needs** (it was 5.9× before
-  quantisation-aware training and the 5-bit default; see *Where the bits went*). The serious research
+  **Measure the baseline in `yuv444p`, not `yuv420p`.** An earlier version of
+  this benchmark encoded the x264 reference at 4:2:0 while scoring PSNR in RGB.
+  That throws away three quarters of the colour before x264 sees it, and on a
+  chroma-rich clip it caps x264 at **30.25 dB even at crf 0** — below what this
+  codec reaches, so there was no matched-quality point at all and the "closest"
+  row compared two different qualities. It made this codec look roughly twice
+  as good as it is. `--compare` now defaults to `yuv444p`, interpolates along
+  the rate-distortion curve instead of snapping to the nearest row, and refuses
+  to print a ratio when the two do not overlap in quality. `--compare-pix
+  yuv420p` still gives the deployment-realistic figure. The serious research
   versions do far better — HiNeRV and friends land in roughly HEVC/x265 territory
   on standard test sets — but they are much larger, trained far longer, and still
   generally trail the best conventional codecs (VVC) and the best learned
@@ -159,6 +165,57 @@ that reproduces the data), and it is not something to replace H.264 with today.
 
 ---
 
+## Which architecture, and why it depends on the footage
+
+`--arch nerv` builds each frame's feature map with an MLP over a Fourier
+embedding of the timestamp. `--arch grid` stores those feature maps directly as
+a learned tensor interpolated in time, and can inject a second finer grid
+partway up the decoder.
+
+The reason to try the grid at all came from measurement. The dense convolution
+weights carry no exploitable structure — adjacent taps inside their 3×3 kernels
+correlate at 0.018, a DCT of them concentrates no energy, and they are not
+usefully low rank — so no amount of cleverness in the *coding* helps. At the
+same time the allocation was lopsided: 59% of the parameters sat in the first
+upsampling convolution, which is shared by every frame and is the least
+quantisation-sensitive tensor in the model, while everything that distinguishes
+one frame from the next passed through 8% of the parameters.
+
+Neither architecture wins outright. At a matched 150k budget and 400 epochs:
+
+| clip | `nerv` | `grid` |
+|---|---|---|
+| textured pan | 29.37 dB / 72.9 KB | **31.80 dB / 73.5 KB** |
+| smooth gradients | **33.15 dB / 70.3 KB** | 31.79 dB / 72.2 KB |
+
+Same budget, same epochs, opposite winners. Where the content is smooth in
+time, an MLP over a Fourier embedding *is* the right prior and generalises
+between frames for free; where every frame carries its own texture, storing the
+codes beats deriving them. `nerv` is the default because it is the safer of the
+two, but on real footage try both — the gap runs to a couple of dB either way.
+
+**The grid trains more slowly, so do not judge it early.** On the textured clip
+it is behind at 40 epochs, ahead by 120, and further ahead by 400:
+
+| epochs | `nerv` | `grid` |
+|---|---|---|
+| 40 | **23.89 dB** | 22.32 dB |
+| 120 | 27.28 dB | **28.67 dB** |
+| 400 | 29.37 dB | **31.80 dB** |
+
+This also rules out picking the architecture automatically with a short probe:
+at 40 epochs the probe confidently chooses the one that loses by 2.4 dB.
+
+Two more results worth keeping. Halving the grid's temporal resolution costs
+1.35 dB on content that moves, so one slice per frame is right. And grids are
+*not* more compressible than dense weights, which was the original hypothesis:
+a trained base grid codes to 4.213 bits/value against 4.013 for the convolution
+next to it, and delta coding it along time makes matters worse. Nothing in a
+reconstruction loss asks neighbouring slices to resemble each other.
+`--grid-smooth` adds that pressure explicitly.
+
+---
+
 ## Where the bits went
 
 Rather than guess at improvements, measure. Three experiments on the clip above,
@@ -170,7 +227,8 @@ the zeroth-order entropy of the quantised weights (6.965 vs 6.787 bits/weight at
 kills the most obvious "improvement" before any of it gets written.
 
 **2. Eight bits was wasteful, and quantisation-aware training is what makes low
-bit depths usable.** Rounding weights only *after* training means the network
+bit depths usable.** (These are self-comparisons on identical clips and
+settings, so the x264 baseline error above does not touch them.) Rounding weights only *after* training means the network
 never sees the rounding error and cannot compensate. Rounding them in the
 forward pass for the second half of training (with a straight-through estimator
 for the backward pass) changes the picture completely:
@@ -217,7 +275,9 @@ compound and no one tensor dominates. Filed under "true but not useful".
 | `--progressive` / `--qat-jitter` | write a truncatable file, and train it to survive truncation. See below. |
 | `--strides` | nerv upsample factors, e.g. `2,2,2,2,2`. Their product sets the base feature map size and must divide the frame dimensions. |
 | `--min-channels` | floor on block widths, and therefore the smallest model the architecture can express: a floor of 16 cannot go below ~66k parameters, 8 reaches ~22k, 4 reaches ~8k. Chosen automatically from `--params` (largest floor that fits, since a high floor also measures better — 30.00 dB vs 29.55 dB at a 150k budget); set it by hand to override. |
-| `--compare` | benchmark against libx264 at matched quality. Use it before believing any compression claim, including this README's. |
+| `--compare` | benchmark against libx264 at matched quality, interpolated along its rate-distortion curve. Use it before believing any compression claim, including this README's. |
+| `--compare-pix` | pixel format for that baseline. `yuv444p` (default) matches this codec's colour fidelity; `yuv420p` is what real deployments ship, but caps PSNR when scored in RGB. |
+| `--arch` | `nerv`, `grid` or `siren`. See the section above — which of the first two wins depends on the footage. |
 
 Rough guide: a 48-frame 128×128 clip at `--params 200k --epochs 600` takes a
 couple of minutes on a CPU. Push resolution or frame count and use a GPU
