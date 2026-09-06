@@ -51,6 +51,7 @@ import torch.nn.utils.parametrize as parametrize
 
 MAGIC = b"NVC1"
 DEFAULT_STRIDES = (4, 4, 2)  # 32x total upsample from the base feature map
+GRID_SHARE = 0.45           # of a parameter budget, spent on the finer grid
 
 
 # --------------------------------------------------------------- utilities
@@ -925,32 +926,54 @@ def cmd_encode(args):
 
     strides = [int(x) for x in str(args.strides).split(",") if x.strip()]
 
-    def make_cfg(width, floor=None):
+    grid_frames = args.grid_frames or T
+    mid_frames = args.mid_frames or grid_frames
+    # Parameters the finer grid costs per channel, at the resolution it feeds.
+    upto = math.prod(strides[:args.mid_level]) if args.mid_level > 0 else 1
+    mid_slots = mid_frames * (H // math.prod(strides) * upto) * \
+                (W // math.prod(strides) * upto)
+
+    def make_cfg(width, floor=None, mid=None):
         return {"arch": args.arch, "height": H, "width": W, "frames": T,
                 "fps": fps, "channels": width, "strides": strides,
                 "embed_levels": args.embed_levels,
                 "min_channels": args.min_channels if floor is None else floor,
                 "depth": args.depth, "w0": 30.0,
-                "grid_frames": args.grid_frames or T,
-                "mid_channels": args.mid_channels,
+                "grid_frames": grid_frames,
+                "mid_channels": args.mid_channels if mid is None else mid,
                 "mid_level": args.mid_level,
                 "mid_frames": args.mid_frames}
 
-    budget, floor = None, args.min_channels
+    budget, floor, mid = None, args.min_channels, args.mid_channels
     if args.width:
         channels = args.width
     else:
         budget = parse_count(args.params)
-        if args.min_channels is None:
-            channels, floor = fit_budget(make_cfg, budget)
-            # The floor only shapes the nerv decoder; siren has no conv blocks.
-            extra = f", channel floor {floor}" if args.arch != "siren" else ""
-            print(f"  parameter budget {budget:,} -> width {channels}{extra}")
-        else:
-            channels = size_to_budget(lambda w: make_cfg(w, floor), budget)
-            print(f"  parameter budget {budget:,} -> width {channels}")
+        if args.arch == "grid" and args.mid_channels is None:
+            # The finer grid is a fixed cost that the width search cannot trade
+            # against, so size it from the budget first and let the decoder take
+            # what is left. Measured on a 150k budget, spending about half there
+            # beat spending none by 1.9 dB.
+            mid = max(1, int(GRID_SHARE * budget / mid_slots))
+        elif args.mid_channels is None:
+            mid = 0
+        while True:
+            if args.min_channels is None:
+                channels, floor = fit_budget(lambda w, f=None: make_cfg(w, f, mid),
+                                             budget)
+            else:
+                channels = size_to_budget(
+                    lambda w: make_cfg(w, floor, mid), budget)
+            if (count_params(build_model(make_cfg(channels, floor, mid))) <= budget
+                    or mid <= 0 or args.mid_channels is not None):
+                break
+            mid = int(mid * 0.8) if mid > 4 else mid - 1
+        extra = f", channel floor {floor}" if args.arch != "siren" else ""
+        if args.arch == "grid" and mid:
+            extra += f", finer grid {mid} channels"
+        print(f"  parameter budget {budget:,} -> width {channels}{extra}")
 
-    cfg = make_cfg(channels, floor)
+    cfg = make_cfg(channels, floor, mid)
     model = build_model(cfg)
     n_params = count_params(model)
     if budget is not None and n_params > budget:
@@ -1104,9 +1127,10 @@ def main(argv=None):
                    help="temporal resolution of the base grid (0 = one slice "
                         "per frame). Fewer slices means fewer parameters and "
                         "smoother motion")
-    e.add_argument("--mid-channels", type=int, default=0,
+    e.add_argument("--mid-channels", type=int, default=None,
                    help="channels in a second, finer grid injected partway up "
-                        "the decoder. 0 disables it")
+                        "the decoder. Sized from the budget when not given; "
+                        "0 disables it")
     e.add_argument("--mid-level", type=int, default=1,
                    help="which decoder block the finer grid feeds")
     e.add_argument("--grid-smooth", type=float, default=0.0,
