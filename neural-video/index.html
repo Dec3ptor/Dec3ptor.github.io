@@ -129,7 +129,8 @@
     </div>
 
     <div class="bar"><i id="prog"></i></div>
-    <div id="status">Load a video file, or click “use demo clip” to try it with a synthetic one.</div>
+    <div id="status" style="display:inline">Load a video file, or click “use demo clip” to try it with a synthetic one.</div>
+    <span id="beat" class="note" style="font-size:12px; margin-left:8px"></span>
 
     <div class="stage">
       <div class="frame">
@@ -261,6 +262,18 @@ async function backendUsable() {
     [cost, x, w].forEach(t => { try { t && t.dispose(); } catch (e) {} });
     try { opt && opt.dispose(); } catch (e) {}
   }
+}
+
+/** Hand the main thread back so the page can paint.
+ *  tf.nextFrame() is requestAnimationFrame, which a browser is free to starve
+ *  while the GPU is saturated - and never fires at all in a hidden tab, which
+ *  would wedge the loop permanently. Race it against a timer so progress never
+ *  depends on the compositor being willing to schedule us. */
+function yieldToUi() {
+  return Promise.race([
+    tf.nextFrame(),
+    new Promise(r => setTimeout(r, 40)),
+  ]);
 }
 
 function status(msg) { $("status").textContent = msg; }
@@ -575,7 +588,7 @@ async function train() {
   }
   status(`training ${nParams.toLocaleString()} parameters on ${tf.getBackend()}...`);
   await tf.nextFrame();
-  let lastMse = 1, t0 = performance.now(), lastYield = t0;
+  let lastMse = 1, t0 = performance.now();
   const totalSteps = epochs * stepsPerEpoch;
   let stepsDone = 0;
 
@@ -599,29 +612,25 @@ async function train() {
       sum += loss; ran++; stepsDone++; lastMse = loss;
 
       // Awaiting a GPU readback resolves in a microtask, and microtasks never
-      // let the browser paint. Without an explicit animation frame the page is
-      // frozen for the whole run and looks hung. Yield on a time budget rather
-      // than every step, so the rAF cadence does not throttle training.
+      // let the browser paint. Yield after every step: at hundreds of ms per
+      // step the handover costs nothing, and rate-limiting it turned out to
+      // leave the page looking frozen on hardware that schedules rAF poorly.
       const now = performance.now();
-      if (now - lastYield > 80) {
-        lastYield = now;
-        const secs = (now - t0) / 1000;
-        const eta = secs / stepsDone * (totalSteps - stepsDone);
-        status(`epoch ${epoch + 1}/${epochs} · step ${stepsDone}/${totalSteps} — ` +
-               `${psnrFromMse(lastMse).toFixed(2)} dB — ${fmtTime(secs)} in, ` +
-               `~${fmtTime(eta)} left (${(secs * 1000 / stepsDone).toFixed(0)} ms/step, ` +
-               `${tf.getBackend()})`);
-        progress(0.15 + 0.8 * stepsDone / totalSteps);
-        await tf.nextFrame();
-      }
+      const secs = (now - t0) / 1000;
+      const eta = secs / stepsDone * (totalSteps - stepsDone);
+      status(`epoch ${epoch + 1}/${epochs} · step ${stepsDone}/${totalSteps} — ` +
+             `${psnrFromMse(lastMse).toFixed(2)} dB — ${fmtTime(secs)} in, ` +
+             `~${fmtTime(eta)} left (${(secs * 1000 / stepsDone).toFixed(0)} ms/step, ` +
+             `${tf.getBackend()})`);
+      progress(0.15 + 0.8 * stepsDone / totalSteps);
+      await yieldToUi();
       if (stopRequested) break;
     }
     if (ran) lastMse = sum / ran;
 
     if (epoch % 5 === 0 || epoch === epochs - 1 || stopRequested) {
       await previewFrame(Math.floor(clip.n / 2));
-      await tf.nextFrame();
-      lastYield = performance.now();
+      await yieldToUi();
     }
   }
 
@@ -714,6 +723,27 @@ function report(nParams, channels, mse, bytes) {
 
 // ---------------------------------------------------------------- playback
 
+let beatTimer = null;
+
+/** Ticks off a timer, not off the training loop. If the spinner keeps moving
+ *  the page is alive and simply busy; if it stops, the main thread is blocked.
+ *  That distinction is otherwise impossible to make from the outside. */
+function startBeat() {
+  stopBeat();
+  const frames = "|/-\\";
+  const t0 = performance.now();
+  let i = 0;
+  beatTimer = setInterval(() => {
+    $("beat").textContent =
+      `${frames[i++ % 4]} ${((performance.now() - t0) / 1000).toFixed(0)}s`;
+  }, 250);
+}
+
+function stopBeat() {
+  if (beatTimer) { clearInterval(beatTimer); beatTimer = null; }
+  $("beat").textContent = "";
+}
+
 function stopPlayback() { if (playTimer) { clearInterval(playTimer); playTimer = null; } }
 
 function startPlayback() {
@@ -797,12 +827,14 @@ $("train").addEventListener("click", async () => {
   stopRequested = false;
   $("train").disabled = true; $("play").disabled = true;
   $("save").disabled = true; $("stop").disabled = false;
+  startBeat();
   try {
     await train();
   } catch (err) {
     console.error(err);
     status(`training failed: ${err.message}`);
   }
+  stopBeat();
   $("train").disabled = false; $("stop").disabled = true;
 });
 
@@ -849,6 +881,15 @@ $("loadw").addEventListener("change", async e => {
 // console. Nothing on the page reads it.
 window.__nvc = { TinyNeRV, fitBudget, paramCountFor, pixelShuffle,
                  get net() { return net; }, get clip() { return clip; } };
+
+// A phone doing 96px x 32 frames x 250 epochs is 2000 optimisation steps.
+// Start somewhere it can finish, and let the user turn it up deliberately.
+if (Math.min(screen.width, screen.height) < 700 ||
+    /iPhone|iPad|Android/.test(navigator.userAgent)) {
+  $("res").value = "64";
+  $("nframes").value = "16";
+  $("epochs").value = "100";
+}
 
 if (typeof tf === "undefined") {
   status("TensorFlow.js failed to load — check your network connection.");
