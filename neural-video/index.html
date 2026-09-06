@@ -545,10 +545,12 @@ function report(nParams, channels, mse, bytes) {
     .map(([k, v]) => `<tr><td>${k}</td><td>${v}</td></tr>`).join("");
 
   $("verdict").innerHTML = psnr >= 32
-    ? `Recognisable reconstruction at ${bpp.toFixed(2)} bpp. For reference, ` +
-      `H.264 typically holds this kind of clip at similar quality for well under ` +
-      `0.1 bpp — so this is real compression, just not competitive compression. ` +
-      `Run <code>nvc.py encode --compare</code> for a like-for-like x264 benchmark.`
+    ? `Recognisable reconstruction at ${bpp.toFixed(2)} bpp, out of nothing but ` +
+      `network weights — so yes, this is real compression. It is not competitive ` +
+      `compression: x264 generally reaches the same PSNR on the same frames in a ` +
+      `fraction of the bytes, and it does it in milliseconds instead of minutes. ` +
+      `Run <code>nvc.py encode --compare</code> for the like-for-like numbers on ` +
+      `your own clip rather than taking a figure on trust.`
     : `Only ${psnr.toFixed(1)} dB — the network is too small, or undertrained, for ` +
       `this clip. Raise the weight budget or the epoch count and try again.`;
 }
